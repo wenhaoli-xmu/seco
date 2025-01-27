@@ -1,0 +1,14 @@
+{
+    "concat": {
+        "text": {
+            "trunc_rear": true,
+            "trunc_txt": 24,
+            "train": true
+        }
+    },
+    "truncation": {
+        "enable": true,
+        "max_tokens": 8192,
+        "order": ["text"]
+    }
+}

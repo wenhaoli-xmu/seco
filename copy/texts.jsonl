@@ -1,0 +1,10 @@
+{"text": "To support my point, the \"Diffusion world\" has already a library to average redundant tokens in the forward pass to speed up latency."}
+{"text": "The new sequence obtained is almost two times smaller and is then feed to the other layers after the merge. The intuition behind the NULL token is the centrale role played by the token to share information (a sink token) and the need to attend to the last token fully for grammatical purpose."}
+{"text": "Without surprises (or maybe with I don't know what you expected), the accuracy between the merged prediction and the base prediction grows linearly with the moment where you apply the merge. However, even at lower level, the merged model still achieves good results by quickly reaching 80% of agreement with the base model. No patterns seem to emerge from the sequence length."}
+{"text": "Today is the beginning of our moonshot to solve embodied AGI in the physical world. I’m so excited to announce Project GR00T, our new initiative to create a general-purpose foundation model for humanoid robot learning."}
+{"text": "Amazing Jim, this looks so ripe for unsupervised environment design, automated curriculum learning, and world model learning—if you haven't already, check out the seminal work by"}
+{"text": "Abu Dhabi set to break world record with staggering 53 minute non-stop New Year’s fireworks display."}
+{"text": "President Trump, Elon Musk, and Musk’s son X are celebrating New Year’s Eve together at Mar-a-Lago."}
+{"text": "cross-attention is mostly used in encoder-decoder models where you need to establish a relationship between two input sequences."}
+{"text": "Happy New Year! To kick off the year, I've finally been able to format  and upload the draft of my AI Research Highlights of 2024 article.It covers a variety of topics, from mixture-of-experts models to new LLM  scaling laws for precision:"}
+{"text": "Training approaches have evolved from supervised learning to pre-training and fine-tuning, now focusing on cost-efficient deployment. Current focus is on achieving high performance through minimal computational resources."}

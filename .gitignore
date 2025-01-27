@@ -1,0 +1,12 @@
+# checkpoints & model files
+ckp/*
+
+# datasets
+**/__pycache__
+data
+data_cache
+
+# misc
+*.egg-info
+*.pyc
+*.jpg

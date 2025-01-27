@@ -1,0 +1,16 @@
+{
+    "conversation": {
+        "conv_template": "vicuna_v1.1",
+        "conv_keyword": "conversations",
+        "role_keyword": "role",
+        "cont_keyword": "content",
+        "roles": {
+            "user": 0,
+            "assistant": 1
+        }
+    },
+    "truncation": {
+        "enable": true,
+        "max_tokens": 2048
+    }
+}

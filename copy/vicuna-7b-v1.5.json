@@ -1,0 +1,17 @@
+{
+    "model": {
+        "model_name": "lmsys/vicuna-7b-v1.5",
+        "model_dtype": "bf16",
+        "model_method": "generate",
+        "model_structure": null,
+        "save_ckp": null,
+        "load_ckp": null,
+        "config": "config/train.json",
+        "device_map": null
+    },
+    "eval": {
+        "file_path": "data/slimpajama/arxiv.json",
+        "config": "config/slimpajama-trunc512.json",
+        "max_instance": 10
+    }
+}

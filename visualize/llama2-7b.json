@@ -1,0 +1,17 @@
+{
+    "model": {
+        "model_name": "meta-llama/Llama-2-7b-hf",
+        "model_dtype": "bf16",
+        "model_method": "eval",
+        "model_structure": null,
+        "save_ckp": null,
+        "load_ckp": "ckp/model.pth",
+        "config": "config/train.json",
+        "device_map": null
+    },
+    "eval": {
+        "file_path": "data/slimpajama/arxiv.json",
+        "config": "config/slimpajama-trunc512.json",
+        "max_instance": 10
+    }
+}
