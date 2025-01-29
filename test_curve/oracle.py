@@ -135,25 +135,28 @@ if __name__ == '__main__':
     history = History(args.log_step)
 
     for step, batch in enumerate(loader):
-        lr_adjuster(step)
+        lr_adjuster(step=step)
         history.init()
 
         kv_cache = SecoCache(model.num_layers)
         accum_loss = 0
 
-        input_ids = list(chunkize(batch['input_ids'], -1, 128))
-        labels = list(chunkize(batch['labels'], -1, 128))
+        input_ids = list(chunkize(batch['input_ids'], -1, args.chunk_size))
+        labels = list(chunkize(batch['labels'], -1, args.chunk_size))
 
-        with torch.no_grad():
-            for i, (chunk_input_ids, chunk_labels) in enumerate(zip(input_ids, labels)):
-                loss = model(
-                    input_ids=chunk_input_ids,
-                    labels=chunk_labels,
-                    kv_cache=kv_cache,)
-                accum_loss += loss.sum() / batch['seq_len']
+        for i, (chunk_input_ids, chunk_labels) in enumerate(zip(input_ids, labels)):
+            loss = model(
+                input_ids=chunk_input_ids,
+                labels=chunk_labels,
+                kv_cache=kv_cache,)
+            accum_loss += loss.sum() / batch['seq_len']
 
+        accum_loss.backward()
         history.step(accum_loss.item(), batch['seq_len'])
-
+        
+        if (step + 1) % args.accum_grad:
+            optimizer.step()
+            zero_grad(params)
 
     output = json.dumps(history.loss)
     print(output)

@@ -85,6 +85,8 @@ if __name__ == '__main__':
     parser.add_argument("--env-conf", type=str, required=True)
 
     # others
+    parser.add_argument("--chunk-size", type=int, default=128)
+    parser.add_argument("--sample", type=int, default=100)
     parser.add_argument("--log-step", type=int, default=100)
     parser.add_argument("--accum-grad", type=int, default=1)
 
@@ -105,6 +107,10 @@ if __name__ == '__main__':
 
     params = model.ft_params()
     optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(**env_conf['train'], params=params)
+
+    for param in params:
+        if param.sum().item() == 0:
+            param.data = torch.randn_like(param) * 0.001
 
 
     # build dataset
@@ -130,63 +136,38 @@ if __name__ == '__main__':
     print(colorize("yellow", "Base GPU memory allocated:") + colorize("green", f"{base_memory_allocated // 1024 ** 2} MB"))
     history = History(args.log_step)
 
-    for step, batch in enumerate(loader):
+    batch = next(iter(loader))
+    grads = []
 
-        lr_adjuster(step=step)
-                
+    for _ in range(args.sample):
         history.init()
-        
-        # loss = model(
-        #     input_ids=batch['input_ids'],
-        #     labels=batch['labels']).sum() / batch['seq_len']
-        # loss.backward()
 
         kv_cache = SecoCache(model.num_layers)
-        accum_loss = []
+        accum_loss = 0
 
-        input_ids = list(chunkize(batch['input_ids'], -1, 128))
-        labels = list(chunkize(batch['labels'], -1, 128))
+        input_ids = list(chunkize(batch['input_ids'], -1, args.chunk_size))
+        labels = list(chunkize(batch['labels'], -1, args.chunk_size))
 
         for i, (chunk_input_ids, chunk_labels) in enumerate(zip(input_ids, labels)):
+            loss = model(
+                input_ids=chunk_input_ids,
+                labels=chunk_labels,
+                kv_cache=kv_cache,)
+            accum_loss += loss.sum() / batch['seq_len']
 
-            if i < 3:
-                with torch.no_grad():
-                    loss = model(
-                        input_ids=chunk_input_ids,
-                        labels=chunk_labels,
-                        kv_cache=kv_cache,)
-            else:
-                loss = model(
-                    input_ids=chunk_input_ids,
-                    labels=chunk_labels,
-                    kv_cache=kv_cache,)
-            
-            accum_loss.append(loss.sum() / batch['seq_len'])
+        accum_loss.backward()
 
+        grad = [param.grad.data.clone() if param.grad is not None else torch.zeros_like(param) for param in params]
+        grads.append(grad)
+        zero_grad(params)
 
-        for layer_idx in range(model.num_layers):
-            for x in kv_cache.k_cache[layer_idx]:
-                if x.requires_grad:
-                    x.retain_grad()
-            for y in kv_cache.v_cache[layer_idx]:
-                if y.requires_grad:
-                    y.retain_grad()
+    grads = [torch.cat([y.ravel() for y in x]) for x in grads]
+    grads = torch.stack(grads)
 
-
-        accum_loss[-1].backward()
-        import IPython
-        IPython.embed()
-
-
-
-        history.step(accum_loss.item(), batch['seq_len'])
-
-        if (step + 1) % args.accum_grad == 0:
-            optimizer.step()
-            zero_grad(params)
-
-    output = json.dumps(history.loss)
-    print(output)
+    if not os.path.exists("grads"):
+        os.mkdir("grads")
+    
+    torch.save(grads, "grads/oracle.pth")
 
 
     backend_cleanup()

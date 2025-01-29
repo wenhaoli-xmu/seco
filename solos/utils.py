@@ -226,7 +226,6 @@ class SecoCache:
         def hook_fn(grad, base):
             if scaler is not None:
                 return grad + base * scaler
-            assert (base != 0).count_nonzero() == 0
             return grad + base
 
         for layer_idx in range(self.num_layers):

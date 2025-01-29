@@ -20,7 +20,7 @@ def model_forward(self, input_ids, **kwargs):
     :kwargs: To absorb useless arguments passed by lib peft
     """
     hidden_states = self.model(input_ids)
-    logits = self.lm_head(hidden_states).cpu()
+    logits = self.lm_head(hidden_states)
     return logits
 
 

@@ -3,6 +3,6 @@
         "enable": true,
         "r": 8,
         "a": 16,
-        "dropout": 0.0
+        "dropout": 0
     }
 }

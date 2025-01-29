@@ -3,9 +3,13 @@ import types
 import torch.distributed
 from transformers.models.llama.modeling_llama import repeat_kv
 from ..modifier import Modifier
-from .utils import check_and_apply_qk_rope, do_projection
+from .utils import check_and_apply_qk_rope, do_projection, generate_mask
 from peft import LoraConfig, get_peft_model, TaskType
 from flash_attn import flash_attn_func
+
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
 def model_forward(self, input_ids, kv_cache, **kwargs):
@@ -40,7 +44,7 @@ def layer_forward(self, hidden_states, kv_cache):
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
     hidden_states = self.self_attn(hidden_states, kv_cache)
-    hidden_states = residual + hidden_states
+    hidden_states = residual.to(hidden_states.device) + hidden_states
 
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
@@ -77,10 +81,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
         k=keys.transpose(-2,-3),
         v=vals.transpose(-2,-3),
         causal=True)
-    
-    if torch.is_grad_enabled():
-        self.attn_output = attn_output
-        self.attn_output.retain_grad()
+
 
     attn_output = attn_output.flatten(2)
     attn_output = self.o_proj(attn_output)
@@ -145,7 +146,7 @@ class ModelForTraining(Modifier):
     def forward(self, input_ids, labels, kv_cache):
 
         # compute logits
-        logits = self.model(input_ids=input_ids, kv_cache=kv_cache)
+        logits = self.model(input_ids=input_ids, kv_cache=kv_cache).to(labels.device)
         
         # compute loss
         logits = logits.squeeze(0)

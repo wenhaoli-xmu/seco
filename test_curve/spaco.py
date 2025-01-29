@@ -91,11 +91,15 @@ if __name__ == '__main__':
     # others
     parser.add_argument("--log-step", type=int, default=100)
     parser.add_argument("--accum-grad", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--unbiased_estimate", action='store_true')
 
     args = parser.parse_args()
 
     
     env_conf = get_env_conf(args.env_conf)
+    env_conf['train']['max_lr'] = args.lr
     env_conf['model']['device_map'] = {"": dist.get_rank()}
     dtype = get_torch_dtype(env_conf['model']['model_dtype'])
 
@@ -103,7 +107,7 @@ if __name__ == '__main__':
     # load model
     seed_everything(0)
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
-    seed_everything(dist.get_rank())
+    seed_everything(args.seed)
 
 
     model.train()
@@ -158,15 +162,41 @@ if __name__ == '__main__':
                 loss = model(**inputs)
                 accum_loss += loss.sum().item()
 
-        
         accum_loss /= batch['seq_len']
+
+        
         I = torch.randperm(len(input_ids))[:args.chunk_budget]
 
+
+        for i, (chunk_input, chunk_target) in reversed(list(enumerate(zip(input_ids, labels)))):
+
+
+            if i in I:
+
+                tmp_kv_cache = kv_cache.range(i)
+
+                # forward prop
+                inputs = dict(
+                    input_ids=chunk_input,
+                    labels=chunk_target,
+                    kv_cache=tmp_kv_cache)
+                loss = model(**inputs).sum() / batch['seq_len']
+                loss *= len(input_ids) / args.chunk_budget
+
+                # copy kv cache grad
+                tmp_kv_cache.index(i).copy_scaled_grad(
+                    gd=kv_cache.index(i).grad,
+                    scaler=(len(input_ids) / args.chunk_budget) if args.unbiased_estimate else None)
+
+                # backward prop
+                loss.backward()
+                
 
         history.step(accum_loss, batch['seq_len'])
 
         if (step + 1) % args.accum_grad == 0:
             optimizer.step()
+            zero_grad(params)
 
     output = json.dumps(history.loss)
     print(output)

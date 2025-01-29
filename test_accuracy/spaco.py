@@ -153,7 +153,6 @@ if __name__ == '__main__':
 
     batch = next(iter(loader))
     
-    
 
     for context in args.context:
 

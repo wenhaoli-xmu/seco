@@ -4,6 +4,8 @@ torchrun \
     --nnodes 1 \
     --nproc_per_node 1 \
     test_curve/baseline.py \
-    --env-conf test_curve/llama3-8b-ckpt.json \
-    --accum-grad 8 \
-    --log-step 1
+    --env-conf test_curve/llama3-8b.json \
+    --accum-grad 1 \
+    --log-step 1 \
+    --seed 0 \
+    --lr 1e-5

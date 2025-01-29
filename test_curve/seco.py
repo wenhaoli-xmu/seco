@@ -90,11 +90,14 @@ if __name__ == '__main__':
     # others
     parser.add_argument("--log-step", type=int, default=100)
     parser.add_argument("--accum-grad", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=1e-4)
 
     args = parser.parse_args()
 
     
     env_conf = get_env_conf(args.env_conf)
+    env_conf['train']['max_lr'] = args.lr
     env_conf['model']['device_map'] = {"": dist.get_rank()}
     dtype = get_torch_dtype(env_conf['model']['model_dtype'])
 
@@ -102,10 +105,10 @@ if __name__ == '__main__':
     # load model
     seed_everything(0)
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
-    seed_everything(dist.get_rank())
+    seed_everything(args.seed)
 
 
-    model.train()
+    model.eval()
 
 
     params = model.ft_params()
@@ -135,8 +138,11 @@ if __name__ == '__main__':
     print(colorize("yellow", "Base GPU memory allocated:") + colorize("green", f"{base_memory_allocated // 1024 ** 2} MB"))
     history = History(args.log_step)
 
-    for step, batch in enumerate(loader):
 
+    batch = next(iter(loader))
+    grads = []
+
+    for step, batch in enumerate(loader):
         input_ids = list(chunkize(batch['input_ids'], -1, args.chunk_size))
         labels = list(chunkize(batch['labels'], -1, args.chunk_size))
         kv_cache = SecoCache(model.num_layers)
@@ -166,28 +172,15 @@ if __name__ == '__main__':
                 input_ids=chunk_input,
                 labels=chunk_target,
                 kv_cache=tmp_kv_cache)
+
             loss = model(**inputs).sum() / batch['seq_len']
             accum_loss += loss.item() 
 
-
-            this_kv_cache = tmp_kv_cache.index(i)
-
-            for layer_idx in range(model.num_layers):
-                for x in this_kv_cache.k_cache[layer_idx]:
-                    if x.requires_grad:
-                        x.retain_grad()
-                for y in this_kv_cache.v_cache[layer_idx]:
-                    if y.requires_grad:
-                        y.retain_grad()
-
             # copy kv cache grad
-            # tmp_kv_cache.index(i).copy_scaled_grad(gd=kv_cache.index(i).grad)
+            tmp_kv_cache.index(i).copy_scaled_grad(gd=kv_cache.index(i).grad)
 
             # backward prop
             loss.backward()
-
-            import IPython 
-            IPython.embed()
 
         history.step(accum_loss, batch['seq_len'])
 
@@ -197,6 +190,5 @@ if __name__ == '__main__':
 
     output = json.dumps(history.loss)
     print(output)
-
 
     backend_cleanup()
