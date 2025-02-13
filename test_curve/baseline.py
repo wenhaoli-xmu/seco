@@ -85,7 +85,6 @@ if __name__ == '__main__':
     parser.add_argument("--env-conf", type=str, required=True)
 
     # others
-    parser.add_argument("--chunk-size", type=int, default=128)
     parser.add_argument("--log-step", type=int, default=100)
     parser.add_argument("--accum-grad", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
@@ -104,7 +103,7 @@ if __name__ == '__main__':
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
     seed_everything(args.seed)
 
-    model.train()
+    model.eval()
 
 
     params = model.ft_params()
@@ -135,25 +134,22 @@ if __name__ == '__main__':
     history = History(args.log_step)
 
     for step, batch in enumerate(loader):
-        lr_adjuster(step)
+
+        lr_adjuster(step=step)
+
         history.init()
 
-        kv_cache = SecoCache(model.num_layers)
-        accum_loss = 0
+        loss = model(
+            input_ids=batch['input_ids'],
+            labels=batch['labels'])
+        loss = loss.sum() / batch['seq_len']
 
-        input_ids = list(chunkize(batch['input_ids'], -1, 128))
-        labels = list(chunkize(batch['labels'], -1, 128))
-
-        with torch.no_grad():
-            for i, (chunk_input_ids, chunk_labels) in enumerate(zip(input_ids, labels)):
-                loss = model(
-                    input_ids=chunk_input_ids,
-                    labels=chunk_labels,
-                    kv_cache=kv_cache,)
-                accum_loss += loss.sum() / batch['seq_len']
-
-        history.step(accum_loss.item(), batch['seq_len'])
-
+        loss.backward()
+        history.step(loss.item(), batch['seq_len'])
+        
+        if (step + 1) % args.accum_grad:
+            optimizer.step()
+            zero_grad(params)
 
     output = json.dumps(history.loss)
     print(output)

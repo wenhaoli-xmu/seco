@@ -139,14 +139,13 @@ if __name__ == '__main__':
     history = History(args.log_step)
 
 
-    batch = next(iter(loader))
-    grads = []
-
     for step, batch in enumerate(loader):
+        lr_adjuster(step=step)
+
         input_ids = list(chunkize(batch['input_ids'], -1, args.chunk_size))
         labels = list(chunkize(batch['labels'], -1, args.chunk_size))
         kv_cache = SecoCache(model.num_layers)
-                
+
         history.init()
         
         with torch.no_grad():
@@ -158,7 +157,6 @@ if __name__ == '__main__':
                     labels=chunk_target,
                     kv_cache=kv_cache)
                 model(**inputs)
-
 
         accum_loss = 0
 
@@ -181,6 +179,7 @@ if __name__ == '__main__':
 
             # backward prop
             loss.backward()
+
 
         history.step(accum_loss, batch['seq_len'])
 

@@ -149,9 +149,11 @@ if __name__ == '__main__':
                 input_ids=chunk_input_ids,
                 labels=chunk_labels,
                 kv_cache=kv_cache,)
+
             accum_loss += loss.sum() / batch['seq_len']
 
         accum_loss.backward()
+
         history.step(accum_loss.item(), batch['seq_len'])
         
         if (step + 1) % args.accum_grad:

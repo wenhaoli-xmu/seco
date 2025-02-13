@@ -171,6 +171,11 @@ class SecoCache:
 
         finally:
             if torch.is_grad_enabled():
+                # assert isinstance(keys, torch.Tensor)
+                # if keys.requires_grad == True:
+                #     keys.retain_grad()
+                # if vals.requires_grad == True:
+                #     vals.retain_grad()
                 self.k_cache[layer_idx].append(keys)
                 self.v_cache[layer_idx].append(vals)
 
@@ -232,8 +237,10 @@ class SecoCache:
             layer_gd = gd[layer_idx]
             key_gd, val_gd = layer_gd
             for i in range(len(self.k_cache[layer_idx])):
+
                 if self.k_cache[layer_idx][i].requires_grad:
                     self.k_cache[layer_idx][i].register_hook(partial(hook_fn, base=key_gd[i]))
+                
                 if self.v_cache[layer_idx][i].requires_grad:
                     self.v_cache[layer_idx][i].register_hook(partial(hook_fn, base=val_gd[i]))
 

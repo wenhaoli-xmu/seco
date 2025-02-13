@@ -1,6 +1,6 @@
 torchrun \
     --rdzv-backend=c10d \
-    --rdzv-endpoint=localhost:50002 \
+    --rdzv-endpoint=localhost:9003 \
     --nnodes 1 \
     --nproc_per_node 1 \
     test_curve/seco.py \
@@ -8,5 +8,5 @@ torchrun \
     --accum-grad 4 \
     --chunk-size 128 \
     --log-step 1 \
-    --seed 0 \
-    --lr 1e-4
+    --seed 3 \
+    --lr 1e-3

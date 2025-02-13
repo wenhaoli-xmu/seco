@@ -5,6 +5,7 @@ ckp/*
 **/__pycache__
 data
 data_cache
+copy
 
 # misc
 *.egg-info
