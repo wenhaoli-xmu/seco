@@ -10,7 +10,6 @@ copy
 # misc
 *.egg-info
 *.pyc
-*.jpg
 *.pth
 results
 grads

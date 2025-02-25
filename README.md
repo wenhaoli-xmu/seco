@@ -1,8 +1,7 @@
-![img](docs/main.jpg)
+![img](docs/main.png)
 
 ## Overview
 
-<!-- 我们提出了SeCO和SpaCO，用于在memory constrained scenarios下训练LLM。 -->
 We propose SeCO and SpaCO for training LLMs under memory-constrained scenarios.
 
 ### Sequential Chunk-wise Optimization (SeCO)
