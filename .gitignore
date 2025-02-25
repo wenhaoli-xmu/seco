@@ -12,3 +12,6 @@ copy
 *.pyc
 *.jpg
 *.pth
+results
+grads
+.vscode

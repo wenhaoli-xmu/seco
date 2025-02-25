@@ -1,8 +1,8 @@
 from setuptools import setup
 
 setup(
-    name='solos',
+    name='chunkoptim',
     version='1.0',
-    packages=['solos'],
+    packages=['chunkoptim'],
     install_requires=[]
 )

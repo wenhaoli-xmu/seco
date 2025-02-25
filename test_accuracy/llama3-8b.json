@@ -1,7 +1,7 @@
 {
     "model": {
         "model_name": "unsloth/llama-3-8b",
-        "model_dtype": "bf16",
+        "model_dtype": "fp16",
         "model_method": "train",
         "model_structure": null,
         "save_ckp": "ckp/model.pth",
@@ -11,16 +11,16 @@
     },
 
     "train": {
-        "train_iters": 2048,
-        "max_lr": 0.001,
+        "train_iters": 1000,
+        "max_lr": 0,
         "warmup": 0.01,
         "beta1": 0.9,
-        "beta2": 0.98,
+        "beta2": 0.95,
         "weight_decay": 0.05,
         "corpus": [
             {
-                "data": "data/slimpajama/arxiv.json",
-                "conf": "config/slimpajama-trunc65536.json",
+                "data": "data/pg19/train.json",
+                "conf": "config/slimpajama-trunc512.json",
                 "partition": 1.0
             }
         ]

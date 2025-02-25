@@ -1,0 +1,9 @@
+accelerate==0.26.1
+transformers==4.37.2
+datasets==2.16.1
+torch==2.3.0
+numpy==1.26.3
+matplotlib==3.8.2
+pygments==2.17.2
+peft==0.10.0
+flash-attn==2.5.8
