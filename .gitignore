@@ -13,4 +13,4 @@ copy
 *.pth
 results
 grads
-.vscode
+.vscode/
