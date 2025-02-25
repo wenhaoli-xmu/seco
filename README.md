@@ -25,3 +25,66 @@ Compared to mainstream training approaches, SeCO and SpaCO demonstrate substanti
 ![img](docs/efficiency.png)
 
 
+## Quick Start
+
+
+### Installation
+
+```bash
+
+$ git clone https://github.com/wenhaoli-xmu/seco.git
+$ cd seco
+$ pip install -e .
+$ pip install -r requirements.txt
+```
+
+### Example
+
+```python
+from chunkoptim.utils import chunkize, SecoCache
+
+
+chunk_size = 128
+
+
+for batch in data_loader:
+    
+    input_ids = list(chunkize(batch.input_ids, -1, chunk_size))
+    labels = list(chunkize(batch.labels, -1, chunk_size))
+    kv_cache = SecoCache(model.num_layers)
+
+    # forward prop
+    with torch.no_grad():
+        for chunk_input, chunk_target in zip(input_ids, labels):
+            inputs = dict(
+                input_ids=chunk_input,
+                labels=chunk_target,
+                kv_cache=kv_cache)
+            model(**inputs)
+
+    accum_loss = 0
+
+    gen = reversed(list(enumerate(zip(input_ids, labels))))
+
+    for i, (chunk_input, chunk_target) in gen:
+
+        tmp_kv_cache = kv_cache.range(i)
+
+        # graph reconstruction
+        inputs = dict(
+            input_ids=chunk_input,
+            labels=chunk_target,
+            kv_cache=tmp_kv_cache)
+
+        loss = model(**inputs).sum() / batch['seq_len']
+        accum_loss += loss.item()
+
+
+        # localized backward prop
+        tmp_kv_cache.index(i).copy_scaled_grad(gd=kv_cache.index(i).grad)
+        loss.backward()
+
+    optim.step()
+    optim.zero_grad()
+```
+
