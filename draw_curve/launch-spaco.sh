@@ -3,8 +3,8 @@ torchrun \
     --rdzv-endpoint=localhost:20004 \
     --nnodes 1 \
     --nproc_per_node 1 \
-    test_curve/spaco.py \
-    --env-conf test_curve/llama3-8b.json \
+    draw_curve/spaco.py \
+    --env-conf draw_curve/llama3-8b.json \
     --accum-grad 4 \
     --chunk-size 128 \
     --chunk-budget 32 \
