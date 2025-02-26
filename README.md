@@ -1,6 +1,6 @@
 ![img](docs/main.png)
 
-[Download Paper](https://github.com/wenhaoli-xmu/seco/edit/main/320.pdf)
+<a href="https://github.com/wenhaoli-xmu/seco/edit/main/320.pdf" target="_blank"> Download Paper </a>
 
 ## Overview
 
