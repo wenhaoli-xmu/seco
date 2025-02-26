@@ -1,5 +1,7 @@
 ![img](docs/main.png)
 
+[Download Paper](https://github.com/wenhaoli-xmu/seco/edit/main/320.pdf)
+
 ## Overview
 
 We propose SeCO and SpaCO for training LLMs under memory-constrained scenarios.
