@@ -1,0 +1,49 @@
+{
+    "model": {
+        "model_name": "unsloth/llama-3-8b",
+        "tokenizer_name": "meta-llama/Llama-3.1-8B-Instruct",
+        "model_dtype": "bf16",
+        "model_method": "train-ckpt",
+        "model_structure": null,
+        "save_ckp": null,
+        "load_ckp": null,
+        "config": "config/train.json",
+        "device_map": null
+    },
+
+    "train": {
+        "train_iters": 1000,
+        "max_lr": 0,
+        "warmup": 0.01,
+        "beta1": 0.9,
+        "beta2": 0.95,
+        "weight_decay": 0.05,
+        "corpus": [
+            {
+                "data": "/data/lwh/activation-beacon-new/gpt/one_detail_book.train.8K.json",
+                "conf": "config/conversation_trunc16k.json",
+                "partition": 0.2
+            },
+            {
+                "data": "/data/lwh/activation-beacon-new/gpt/one_detail_paper.train.8K.json",
+                "conf": "config/conversation_trunc16k.json",
+                "partition": 0.2
+            },
+            {
+                "data": "/data/lwh/activation-beacon-new/longalpaca/train.json",
+                "conf": "config/conversation_trunc16k.json",
+                "partition": 0.2
+            },
+            {
+                "data": "/data/lwh/activation-beacon-new/booksum/train.8K.json",
+                "conf": "config/conversation_trunc16k.json",
+                "partition": 0.2
+            },
+            {
+                "data": "/data/lwh/activation-beacon-new/needle/train.8K.json",
+                "conf": "config/conversation_trunc16k.json",
+                "partition": 0.2
+            }
+        ]
+    }
+}

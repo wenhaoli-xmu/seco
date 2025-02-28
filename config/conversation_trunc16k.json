@@ -1,0 +1,10 @@
+{
+    "conversation": {
+        "template": "llama3-inst.jinja",
+        "unwarp": 1
+    },
+    "truncation": {
+        "enable": true,
+        "max_tokens": 16384
+    }
+}

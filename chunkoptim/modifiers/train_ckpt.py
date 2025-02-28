@@ -1,14 +1,13 @@
 import torch
 import types
 import torch.distributed
-from transformers.models.llama.modeling_llama import repeat_kv
 from ..modifier import Modifier
-from .utils import check_and_apply_qk_rope, do_projection
+from .utils import check_and_apply_qk_rope, do_projection, generate_mask
 from peft import LoraConfig, get_peft_model, TaskType
 from flash_attn import flash_attn_func
 
 from torch.utils.checkpoint import checkpoint
-from torch import distributed as dist
+import torch.nn.functional as F
 
 
 def model_forward(self, input_ids, **kwargs):
@@ -57,11 +56,39 @@ def layer_forward(self, hidden_states):
     return hidden_states
 
 
+def float64_attention(q, k, v, causal=False):
+    num_q_heads = q.shape[-2]
+    num_kv_heads = k.shape[-2]
+
+    head_dim = q.shape[-1]  # Head dimension
+    
+    # Expand keys/values if needed for GQA
+    if num_q_heads > num_kv_heads:
+        expand_factor = num_q_heads // num_kv_heads
+        k = k.tile(1, 1, expand_factor, 1)
+        v = v.tile(1, 1, expand_factor, 1)
+    
+    # Compute scaled dot-product attention
+    attn_scores = torch.einsum("bqhd, bkhd -> bhqk", q, k) / head_dim**0.5
+    
+    if causal:
+        mask = generate_mask(
+            num_query=attn_scores.shape[-2], 
+            num_kv=attn_scores.shape[-1], 
+            dtype=attn_scores.dtype, 
+            device=attn_scores.device)
+        attn_scores += mask
+    
+    attn_probs = F.softmax(attn_scores, dim=-1)
+    attn_output = torch.einsum("bhqk,bkhd->bqhd", attn_probs, v)
+    
+    return attn_output
+
+
 def self_attn_forward(self, hidden_states):
 
     num_heads, embed_dim = self.config.num_attention_heads, self.config.hidden_size
     num_kv_heads = self.config.num_key_value_heads
-    num_kv_group = num_heads // num_kv_heads
     head_dim = embed_dim // num_heads
 
 
@@ -71,13 +98,16 @@ def self_attn_forward(self, hidden_states):
     vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim)
 
     # position embedding
-    len1 = self.config.max_position_embeddings if hasattr(self.config, "max_position_embeddings") else 0
-    len2 = max(ques.shape[-2], keys.shape[-2])
-    cos, sin = self.rotary_emb(keys, seq_len=65536)
-
+    pos = torch.arange(0, keys.shape[-2])
+    pos = pos[None, :].to(keys.device)    
+    cos, sin = self.rotary_emb(keys, pos)
+    cos, sin = cos.squeeze(0), sin.squeeze(0)
     ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
 
-    attn_output = flash_attn_func(
+    # attention computation
+    attn_func = float64_attention if hidden_states.dtype == torch.float64 else flash_attn_func
+
+    attn_output = attn_func(
         q=ques.transpose(-2,-3),
         k=keys.transpose(-2,-3),
         v=vals.transpose(-2,-3),

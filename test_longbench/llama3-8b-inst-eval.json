@@ -1,0 +1,13 @@
+{
+    "model": {
+        "model_name": "unsloth/llama-3-8b",
+        "tokenizer_name": "meta-llama/Llama-3.1-8B-Instruct",
+        "model_dtype": "bf16",
+        "model_method": "train",
+        "model_structure": null,
+        "save_ckp": null,
+        "load_ckp": null,
+        "config": "config/train.json",
+        "device_map": null
+    }
+}

@@ -6,6 +6,7 @@ ckp/*
 data
 data_cache
 copy
+LongBench
 
 # misc
 *.egg-info

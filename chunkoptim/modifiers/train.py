@@ -7,6 +7,7 @@ from .utils import check_and_apply_qk_rope, do_projection, generate_mask
 from peft import LoraConfig, get_peft_model, TaskType
 from flash_attn import flash_attn_func
 import torch.nn.functional as F
+from ..utils import SecoCache
 
 
 torch.backends.cudnn.deterministic = True
@@ -89,7 +90,6 @@ def self_attn_forward(self, hidden_states, kv_cache):
     num_heads, embed_dim = self.config.num_attention_heads, self.config.hidden_size
     num_kv_heads = self.config.num_key_value_heads
     head_dim = embed_dim // num_heads
-
 
     # query & key & value projection
     ques = do_projection(self.q_proj, hidden_states, num_heads, head_dim)
@@ -179,9 +179,40 @@ class ModelForTraining(Modifier):
     def forward(self, input_ids, labels, kv_cache):
 
         # compute logits
-        logits = self.model(input_ids=input_ids, kv_cache=kv_cache).to(labels.device)
-        
-        # compute loss
-        logits = logits.squeeze(0)
-        labels = labels.squeeze(0)
-        return torch.nn.functional.cross_entropy(logits, labels, reduce=False)
+        logits = self.model(input_ids=input_ids, kv_cache=kv_cache).to(input_ids.device)
+
+        if labels is not None:
+            logits = logits.to(labels.device)
+            logits = logits.squeeze(0)
+            labels = labels.squeeze(0)
+            return torch.nn.functional.cross_entropy(logits, labels, reduce=False)
+        else:
+            return logits[:, -1:, :]
+    
+
+    @torch.no_grad()
+    def generate(self, input_ids, tokenizer, max_new_tokens=128, eos_token_id=[2]):
+
+        device = next(iter(self.model.parameters())).device
+        input_ids = input_ids.to(device)
+
+        if input_ids.ndim == 1:
+            input_ids = input_ids.unsqueeze(0)
+
+        kv_cache = SecoCache(len(self.model.model.model.layers))
+
+        logits = self.forward(input_ids=input_ids, labels=None, kv_cache=kv_cache)
+        new_tok = logits.argmax(dim=-1)
+        new_ids = [new_tok]
+
+        while len(new_ids) < max_new_tokens:
+
+            logits = self.forward(input_ids=new_tok, labels=None, kv_cache=kv_cache)
+            new_tok = logits.argmax(dim=-1)
+
+            if new_tok.ravel().item() in eos_token_id: break
+            new_ids.append(new_tok.ravel().item())
+
+        del kv_cache
+        new_ids = torch.tensor(new_ids, dtype=input_ids.dtype, device=input_ids.device)[None, :]
+        return torch.cat([input_ids, new_ids], dim=-1)
