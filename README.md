@@ -2,7 +2,13 @@
 
 [Download Paper](https://github.com/wenhaoli-xmu/seco/raw/main/320.pdf)
 
-## Overview
+## Additional Results
+
+To more comprehensively validate the performance of SeCO and SpaCO, we further compared them with model parallel (running on 4 RTX 3090 GPUs, utilizing gradient checkpointing) in the instruction fine-tuning task. The results are shown in the figure below:
+
+![img](docs/longbench.png)
+
+## 👁️Overview
 
 We propose SeCO and SpaCO for training LLMs under memory-constrained scenarios.
 
@@ -27,7 +33,7 @@ Compared to mainstream training approaches, SeCO and SpaCO demonstrate substanti
 ![img](docs/efficiency.png)
 
 
-## Quick Start
+## 🚀Quick Start
 
 
 ### Installation
