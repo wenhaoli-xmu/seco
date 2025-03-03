@@ -2,7 +2,7 @@
 
 [Download Paper](https://github.com/wenhaoli-xmu/seco/raw/main/320.pdf)
 
-## Additional Results
+## 🤖Inst-Tuning Results
 
 To more comprehensively validate the performance of SeCO and SpaCO, we further compared them with model parallel (running on 4 RTX 3090 GPUs, utilizing gradient checkpointing) in the instruction fine-tuning task. The results are shown in the figure below:
 
