@@ -46,7 +46,7 @@ $ pip install -e .
 $ pip install -r requirements.txt
 ```
 
-### Example
+### Example-1: Single GPU
 
 ```python
 from chunkoptim.utils import chunkize, SecoCache
@@ -94,5 +94,51 @@ for batch in data_loader:
 
     optim.step()
     optim.zero_grad()
+```
+
+### Example-2: Multiple GPUs (Deepspeed)
+
+If you use Deepspeed for distributed training, then the graident won't synchronize until `model_engine.step()` function call, which meets the requirements of SeCO. Otherwise, you should cancel gradient synchronization manually to prevent redandant communication.
+
+```python
+from chunkoptim.utils import chunkize, SecoCache
+chunk_size = 128
+
+for batch in data_loader:
+    input_ids = list(chunkize(batch.input_ids, -1, chunk_size))
+    labels = list(chunkize(batch.labels, -1, chunk_size))
+    kv_cache = SecoCache(model.num_layers)
+
+    # forward prop
+    with torch.no_grad():
+        for chunk_input, chunk_target in zip(input_ids, labels):
+            inputs = dict(
+                input_ids=chunk_input,
+                labels=chunk_target,
+                kv_cache=kv_cache)
+            model_engine(**inputs)
+
+    accum_loss = 0
+
+    gen = reversed(list(enumerate(zip(input_ids, labels))))
+
+    for i, (chunk_input, chunk_target) in gen:
+
+        tmp_kv_cache = kv_cache.range(i)
+
+        # graph reconstruction
+        inputs = dict(
+            input_ids=chunk_input,
+            labels=chunk_target,
+            kv_cache=tmp_kv_cache)
+
+        loss = model_engine(**inputs).sum() / batch['seq_len']
+        accum_loss += loss.item()
+
+        # localized backward prop
+        tmp_kv_cache.index(i).copy_scaled_grad(gd=kv_cache.index(i).grad)
+        model_engine.backward(loss)
+
+    model_engine.step()
 ```
 
