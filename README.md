@@ -98,7 +98,7 @@ for batch in data_loader:
 
 ### Example-2: Multiple GPUs (Deepspeed)
 
-If you use Deepspeed for distributed training, then the graident won't synchronize until `model_engine.step()` function call, which meets the requirements of SeCO. Otherwise, you should cancel gradient synchronization manually to prevent redandant communication.
+⚠️If you use Deepspeed for distributed training, then the graident won't synchronize until the `model_engine.step()` function call, which meets the requirements of SeCO. Otherwise, you should cancel gradient synchronization manually to prevent redandant communication.
 
 ```python
 from chunkoptim.utils import chunkize, SecoCache
