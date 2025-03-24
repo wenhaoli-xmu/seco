@@ -9,6 +9,7 @@ import os, math
 import numpy as np
 import matplotlib.pyplot as plt
 import time 
+from itertools import chain
 
 
 def average_filter(x, window):
@@ -232,6 +233,48 @@ class SecoCache:
                 
                 if self.v_cache[layer_idx][i].requires_grad:
                     self.v_cache[layer_idx][i].register_hook(partial(hook_fn, base=val_gd[i]))
+
+    @torch.no_grad()
+    def squeeze(self):
+        for layer_idx in range(self.num_layers):
+            self.k_cache[layer_idx] = [torch.cat(self.k_cache[layer_idx], dim=-2)]
+            self.v_cache[layer_idx] = [torch.cat(self.v_cache[layer_idx], dim=-2)]
+            self.k_cache[layer_idx][0].requires_grad_(True)
+            self.v_cache[layer_idx][0].requires_grad_(True)
+
+    def delete(self, idx):
+        for layer_idx in len(self.num_layers):
+            del self.k_cache[layer_idx][idx]
+            del self.v_cache[layer_idx][idx]
+
+    @torch.no_grad()
+    def collect_sparse_grad(self, indices):
+        num_chunks = len(self.k_cache[0])
+        assert num_chunks == 1, "Sparse gradient collection does not support multiple chunks."
+
+        grads = list(chain.from_iterable(chain.from_iterable(self.grad)))
+        num_layers_times_2 = self.num_layers * 2
+
+        _, num_heads, _, head_dim = grads[0].shape
+
+        indices = indices[None, :, None, :, None].expand(
+            self.num_layers * 2,
+            -1,
+            num_heads,
+            -1,
+            head_dim)
+
+        sparse_grad_list = []
+        for i in range(num_layers_times_2):
+            grad_i = grads[i]
+            index_i = indices[i]
+            sparse_i = torch.gather(grad_i, dim=2, index=index_i)
+            sparse_grad_list.append(sparse_i)
+
+        sparse_gd = _reorganize_list(sparse_grad_list, dim1=num_layers_times_2, dim2=1)
+        sparse_gd = _reorganize_list(sparse_gd, dim1=self.num_layers, dim2=2)
+
+        return sparse_gd
 
 
     @grad.setter
