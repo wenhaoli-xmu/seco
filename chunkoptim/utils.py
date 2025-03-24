@@ -10,6 +10,9 @@ import numpy as np
 import matplotlib.pyplot as plt
 import time 
 
+from itertools import chain
+from profiler import WallTime
+
 
 def average_filter(x, window):
     y = []
@@ -151,104 +154,179 @@ def get_optimizer_and_lr_adjuster(max_lr, train_iters, warmup, weight_decay, bet
     return optim, lr_adjuster
 
 
-class SecoCache:
-    def __init__(self, num_layers):
-        self.num_layers = num_layers
+def _reorganize_list(x, dim1, dim2):
+    y = []
+    for i in range(dim1):
+        y.append([])
+        for j in range(dim2):
+            y[-1].append(x[i * dim2 + j])
+    return y
+
+
+class LayerCache(torch.nn.Module):
+    def __init__(self, seq_dim=-2):
+        super().__init__()
+        self.seq_dim = seq_dim
         self.reset()
 
+    def reset(self):
+        self.keys = torch.nn.ParameterList()
+        self.vals = torch.nn.ParameterList()
+        self.current_device = 'cuda'
+        self.key_bwd = None
+        self.val_bwd = None
+        self.visible_range = None
 
-    def update(self, layer_idx, keys, vals):
+    def append(self, key, val):
+        self.keys.append(torch.nn.Parameter(key, requires_grad=False))
+        self.vals.append(torch.nn.Parameter(val, requires_grad=False))
+
+    def move_to_cpu(self):
+        if self.current_device != 'cpu':
+            self.to('cpu', non_blocking=True)
+        self.current_device = 'cpu'
+    
+    def move_to_cuda(self):
+        if self.current_device != 'cuda':
+            self.to('cuda', non_blocking=True)
+        self.current_device = 'cuda'
+
+    def length(self):
+        if self.visible_range is not None:
+            past_keys = self.keys[:self.visible_range]
+        else:
+            past_keys = self.keys
+        return sum([x.shape[self.seq_dim] for x in past_keys])
+    
+    def gather(self):
+        past_keys = self.keys if self.visible_range is None else self.keys[:self.visible_range]
+        past_vals = self.vals if self.visible_range is None else self.vals[:self.visible_range]
+        return (
+            torch.cat([*past_keys], dim=self.seq_dim),
+            torch.cat([*past_vals], dim=self.seq_dim))
+    
+    def delete_rear(self):
+        self.keys, key = self.keys[:-1], self.keys[-1]
+        self.vals, val = self.vals[:-1], self.vals[-1]
+        del key, val
+    
+    def update(self, key, val):
         try:
-            ret_keys = torch.cat([*self.k_cache[layer_idx], keys], dim=-2)
-            ret_vals = torch.cat([*self.v_cache[layer_idx], vals], dim=-2)
+            past_keys = self.keys if self.visible_range is None else self.keys[:self.visible_range]
+            past_vals = self.vals if self.visible_range is None else self.vals[:self.visible_range]
+            ret_keys = torch.cat([*past_keys, key], dim=self.seq_dim)
+            ret_vals = torch.cat([*past_vals, val], dim=self.seq_dim)
             return ret_keys, ret_vals
-
         finally:
-            if torch.is_grad_enabled():
-                self.k_cache[layer_idx].append(keys)
-                self.v_cache[layer_idx].append(vals)
-
+            if not torch.is_grad_enabled():
+                self.append(key, val)
             else:
-                k_detach, v_detach = keys.detach(), vals.detach()
-                k_detach.requires_grad_(True)
-                v_detach.requires_grad_(True)
-                self.k_cache[layer_idx].append(k_detach)
-                self.v_cache[layer_idx].append(v_detach)
+                self.key_bwd = key
+                self.val_bwd = val
 
+    def get(self, idx):
+        return self.keys[idx], self.vals[idx]
+    
+    def get_bwd(self):
+        return self.key_bwd, self.val_bwd
+
+    def pre_reconstruction(self, idx):
+        self.visible_range = idx
+
+    def after_backward(self):
+        del self.key_bwd, self.val_bwd
+        self.visible_range = None
+        self.key_bwd = None
+        self.val_bwd = None
+        self.delete_rear()
+
+
+class SecoCache:
+    def __init__(self, num_layers, cpu_offload=None, seq_dim=-2):
+        self.num_layers = num_layers    
+        self.cpu_offload = cpu_offload
+        self.seq_dim = seq_dim
+        self.reset()
+
+    def visit(self, layer_idx, reverse=False):
+        if self.cpu_offload is not None:
+            factor = -1 if reverse else 1
+            cuda_layers = [
+                (layer_idx + self.num_layers + factor * i) % self.num_layers 
+                for i in range(self.cpu_offload)]
+            cpu_layers = filter(lambda x: x not in cuda_layers, range(self.num_layers))
+            for lid in cpu_layers:
+                self.cache[lid].move_to_cpu()
+            for lid in cuda_layers:
+                self.cache[lid].move_to_cuda()
+
+    def update(self, layer_idx, key, val):
+        self.visit(layer_idx)
+        return self.cache[layer_idx].update(key, val)
     
     def length(self, layer_idx):
-        return sum([x.shape[-2] for x in self.k_cache[layer_idx]])
-
+        return self.cache[layer_idx].length()
+    
+    def gather(self, layer_idx):
+        self.visit(layer_idx)
+        return self.cache[layer_idx].gather()
 
     def reset(self):
-        self.k_cache = [[] for _ in range(self.num_layers)]
-        self.v_cache = [[] for _ in range(self.num_layers)]
-        self.seq_len = [0 for _ in range(self.num_layers)]
+        if hasattr(self, 'cache'):
+            del self.cache
+        self.cache = [
+            LayerCache(seq_dim=self.seq_dim) 
+            for _ in range(self.num_layers)]
 
+    def pre_reconstruction(self, idx):
+        for c in self.cache:
+            c.pre_reconstruction(idx)
 
-    def range(self, i):
-        view = SecoCache(self.num_layers)
+    def additive_hook(self, grad, base, layer_idx):
+        self.visit(layer_idx, reverse=True)
+        if base.grad is not None:
+            return grad + base.grad
+        return grad
 
-        for layer_idx in range(view.num_layers):
-            view.k_cache[layer_idx] = self.k_cache[layer_idx][:i]
-            view.v_cache[layer_idx] = self.v_cache[layer_idx][:i]
+    def pre_backward(self, idx):
+        for layer_idx, c in enumerate(self.cache):
+            key, val = c.get(idx)
+            key_bwd, val_bwd = c.get_bwd()
+            key_bwd.register_hook(partial(self.additive_hook, base=key, layer_idx=layer_idx))
+            val_bwd.register_hook(partial(self.additive_hook, base=val, layer_idx=layer_idx))
 
-        return view
+    def after_backward(self):
+        for c in self.cache:
+            c.after_backward()
     
 
-    def index(self, i):
-        view = SecoCache(self.num_layers)
+    def collect_sparse_grad(self, indices):
+        num_chunks = len(self.k_cache[0])
+        assert num_chunks == 1, "Sparse gradient collection does not support multiple chunks."
 
-        for layer_idx in range(view.num_layers):
-            view.k_cache[layer_idx] = self.k_cache[layer_idx][i:i+1]
-            view.v_cache[layer_idx] = self.v_cache[layer_idx][i:i+1]
+        grads = list(chain.from_iterable(chain.from_iterable(self.grad)))
+        num_layers_times_2 = self.num_layers * 2
 
-        return view
+        _, num_heads, _, head_dim = grads[0].shape
 
+        indices = indices[None, :, None, :, None].expand(
+            self.num_layers * 2,
+            -1,
+            num_heads,
+            -1,
+            head_dim)
 
-    @property
-    def grad(self):
-        nest_gd = []
-        for layer_idx in range(self.num_layers):
-            nest_gd_k = [x.grad if x.grad is not None else torch.zeros_like(x) for x in self.k_cache[layer_idx]]
-            nest_gd_v = [x.grad if x.grad is not None else torch.zeros_like(x) for x in self.v_cache[layer_idx]]
-            nest_gd.append([nest_gd_k, nest_gd_v])
-        return nest_gd
-    
+        sparse_grad_list = []
+        for i in range(num_layers_times_2):
+            grad_i = grads[i]
+            index_i = indices[i]
+            sparse_i = torch.gather(grad_i, dim=2, index=index_i)
+            sparse_grad_list.append(sparse_i)
 
-    def copy_scaled_grad(self, gd, scaler=None):
-        def hook_fn(grad, base):
-            if scaler is not None:
-                return grad + base * scaler
-            return grad + base
+        sparse_gd = _reorganize_list(sparse_grad_list, dim1=num_layers_times_2, dim2=1)
+        sparse_gd = _reorganize_list(sparse_gd, dim1=self.num_layers, dim2=2)
 
-        for layer_idx in range(self.num_layers):
-            layer_gd = gd[layer_idx]
-            key_gd, val_gd = layer_gd
-            for i in range(len(self.k_cache[layer_idx])):
-
-                if self.k_cache[layer_idx][i].requires_grad:
-                    self.k_cache[layer_idx][i].register_hook(partial(hook_fn, base=key_gd[i]))
-                
-                if self.v_cache[layer_idx][i].requires_grad:
-                    self.v_cache[layer_idx][i].register_hook(partial(hook_fn, base=val_gd[i]))
-
-
-    @grad.setter
-    def grad(self, value):
-
-        def hook_fn(grad, base):
-            return grad + base
-
-        for layer_idx in range(self.num_layers):
-            layer_gd = value[layer_idx]
-            key_gd, val_gd = layer_gd
-            for i in range(len(self.k_cache[layer_idx])):
-                if self.k_cache[layer_idx][i].requires_grad:
-                    self.k_cache[layer_idx][i].register_hook(partial(hook_fn, base=key_gd[i]))
-                if self.v_cache[layer_idx][i].requires_grad:
-                    self.v_cache[layer_idx][i].register_hook(partial(hook_fn, base=val_gd[i]))
-
+        return sparse_gd
 
 
 def average_filter(x, window):
