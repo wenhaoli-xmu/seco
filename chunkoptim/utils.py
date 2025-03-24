@@ -152,6 +152,15 @@ def get_optimizer_and_lr_adjuster(max_lr, train_iters, warmup, weight_decay, bet
     return optim, lr_adjuster
 
 
+def _reorganize_list(x, dim1, dim2):
+    y = []
+    for i in range(dim1):
+        y.append([])
+        for j in range(dim2):
+            y[-1].append(x[i * dim2 + j])
+    return y
+
+
 class SecoCache:
     def __init__(self, num_layers):
         self.num_layers = num_layers
