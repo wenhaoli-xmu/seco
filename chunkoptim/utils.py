@@ -252,7 +252,7 @@ class SecoCache:
             self.v_cache[layer_idx][0].requires_grad_(True)
 
     def delete(self, idx):
-        for layer_idx in len(self.num_layers):
+        for layer_idx in range(self.num_layers):
             del self.k_cache[layer_idx][idx]
             del self.v_cache[layer_idx][idx]
 
