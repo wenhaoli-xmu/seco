@@ -12,244 +12,244 @@ We used our new implementation, which supports kv cache offloading, to run this 
 
 <details>
 <summary>SecoCache</summary>
-    <code>
-    class LayerCache(torch.nn.Module):
-        def __init__(self, seq_dim=-2):
-            super().__init__()
-            self.seq_dim = seq_dim
-            self.reset()
+<code>
+class LayerCache(torch.nn.Module):
+    def __init__(self, seq_dim=-2):
+        super().__init__()
+        self.seq_dim = seq_dim
+        self.reset()
+
+    def reset(self):
+        self.keys = torch.nn.ParameterList()
+        self.vals = torch.nn.ParameterList()
+        self.current_device = 'cuda'
+        self.key_bwd = None
+        self.val_bwd = None
+        self.visible_range = None
+
+    def append(self, key, val):
+        self.keys.append(torch.nn.Parameter(key, requires_grad=False))
+        self.vals.append(torch.nn.Parameter(val, requires_grad=False))
+
+    def move_to_cpu(self):
+        if self.current_device != 'cpu':
+            self.to('cpu', non_blocking=True)
+        self.current_device = 'cpu'
     
-        def reset(self):
-            self.keys = torch.nn.ParameterList()
-            self.vals = torch.nn.ParameterList()
-            self.current_device = 'cuda'
-            self.key_bwd = None
-            self.val_bwd = None
-            self.visible_range = None
+    def move_to_cuda(self):
+        if self.current_device != 'cuda':
+            self.to('cuda', non_blocking=True)
+        self.current_device = 'cuda'
+
+    def length(self):
+        if self.visible_range is not None:
+            past_keys = self.keys[:self.visible_range]
+        else:
+            past_keys = self.keys
+        return sum([x.shape[self.seq_dim] for x in past_keys])
     
-        def append(self, key, val):
-            self.keys.append(torch.nn.Parameter(key, requires_grad=False))
-            self.vals.append(torch.nn.Parameter(val, requires_grad=False))
+    def gather(self):
+        past_keys = self.keys if self.visible_range is None else self.keys[:self.visible_range]
+        past_vals = self.vals if self.visible_range is None else self.vals[:self.visible_range]
+        return (
+            torch.cat([*past_keys], dim=self.seq_dim),
+            torch.cat([*past_vals], dim=self.seq_dim))
     
-        def move_to_cpu(self):
-            if self.current_device != 'cpu':
-                self.to('cpu', non_blocking=True)
-            self.current_device = 'cpu'
-        
-        def move_to_cuda(self):
-            if self.current_device != 'cuda':
-                self.to('cuda', non_blocking=True)
-            self.current_device = 'cuda'
+    def delete_rear(self):
+        self.keys, key = self.keys[:-1], self.keys[-1]
+        self.vals, val = self.vals[:-1], self.vals[-1]
+        del key, val
     
-        def length(self):
-            if self.visible_range is not None:
-                past_keys = self.keys[:self.visible_range]
-            else:
-                past_keys = self.keys
-            return sum([x.shape[self.seq_dim] for x in past_keys])
-        
-        def gather(self):
+    def update(self, key, val):
+        try:
             past_keys = self.keys if self.visible_range is None else self.keys[:self.visible_range]
             past_vals = self.vals if self.visible_range is None else self.vals[:self.visible_range]
-            return (
-                torch.cat([*past_keys], dim=self.seq_dim),
-                torch.cat([*past_vals], dim=self.seq_dim))
-        
-        def delete_rear(self):
-            self.keys, key = self.keys[:-1], self.keys[-1]
-            self.vals, val = self.vals[:-1], self.vals[-1]
-            del key, val
-        
-        def update(self, key, val):
-            try:
-                past_keys = self.keys if self.visible_range is None else self.keys[:self.visible_range]
-                past_vals = self.vals if self.visible_range is None else self.vals[:self.visible_range]
-                ret_keys = torch.cat([*past_keys, key], dim=self.seq_dim)
-                ret_vals = torch.cat([*past_vals, val], dim=self.seq_dim)
-                return ret_keys, ret_vals
-            finally:
-                if not torch.is_grad_enabled():
-                    self.append(key, val)
-                else:
-                    self.key_bwd = key
-                    self.val_bwd = val
+            ret_keys = torch.cat([*past_keys, key], dim=self.seq_dim)
+            ret_vals = torch.cat([*past_vals, val], dim=self.seq_dim)
+            return ret_keys, ret_vals
+        finally:
+            if not torch.is_grad_enabled():
+                self.append(key, val)
+            else:
+                self.key_bwd = key
+                self.val_bwd = val
+
+    def get(self, idx):
+        return self.keys[idx], self.vals[idx]
     
-        def get(self, idx):
-            return self.keys[idx], self.vals[idx]
-        
-        def get_bwd(self):
-            return self.key_bwd, self.val_bwd
+    def get_bwd(self):
+        return self.key_bwd, self.val_bwd
+
+    def pre_reconstruction(self, idx):
+        self.visible_range = idx
+
+    def after_backward(self):
+        del self.key_bwd, self.val_bwd
+        self.visible_range = None
+        self.key_bwd = None
+        self.val_bwd = None
+        self.delete_rear()
+
+
+class SecoCache:
+    def __init__(self, num_layers, cpu_offload=None, seq_dim=-2):
+        self.num_layers = num_layers    
+        self.cpu_offload = cpu_offload
+        self.seq_dim = seq_dim
+        self.reset()
+
+    def visit(self, layer_idx, reverse=False):
+        if self.cpu_offload is not None:
+            factor = -1 if reverse else 1
+            cuda_layers = [
+                (layer_idx + self.num_layers + factor * i) % self.num_layers 
+                for i in range(self.cpu_offload)]
+            cpu_layers = filter(lambda x: x not in cuda_layers, range(self.num_layers))
+            for lid in cpu_layers:
+                self.cache[lid].move_to_cpu()
+            for lid in cuda_layers:
+                self.cache[lid].move_to_cuda()
+
+    def update(self, layer_idx, key, val):
+        self.visit(layer_idx)
+        return self.cache[layer_idx].update(key, val)
     
-        def pre_reconstruction(self, idx):
-            self.visible_range = idx
+    def length(self, layer_idx):
+        return self.cache[layer_idx].length()
     
-        def after_backward(self):
-            del self.key_bwd, self.val_bwd
-            self.visible_range = None
-            self.key_bwd = None
-            self.val_bwd = None
-            self.delete_rear()
+    def gather(self, layer_idx):
+        self.visit(layer_idx)
+        return self.cache[layer_idx].gather()
+
+    def reset(self):
+        if hasattr(self, 'cache'):
+            del self.cache
+        self.cache = [
+            LayerCache(seq_dim=self.seq_dim) 
+            for _ in range(self.num_layers)]
+
+    def pre_reconstruction(self, idx):
+        for c in self.cache:
+            c.pre_reconstruction(idx)
+
+    def additive_hook(self, grad, base, layer_idx):
+        self.visit(layer_idx, reverse=True)
+        if base.grad is not None:
+            return grad + base.grad
+        return grad
+
+    def pre_backward(self, idx):
+        for layer_idx, c in enumerate(self.cache):
+            key, val = c.get(idx)
+            key_bwd, val_bwd = c.get_bwd()
+            key_bwd.register_hook(partial(self.additive_hook, base=key, layer_idx=layer_idx))
+            val_bwd.register_hook(partial(self.additive_hook, base=val, layer_idx=layer_idx))
+
+    def after_backward(self):
+        for c in self.cache:
+            c.after_backward()
     
-    
-    class SecoCache:
-        def __init__(self, num_layers, cpu_offload=None, seq_dim=-2):
-            self.num_layers = num_layers    
-            self.cpu_offload = cpu_offload
-            self.seq_dim = seq_dim
-            self.reset()
-    
-        def visit(self, layer_idx, reverse=False):
-            if self.cpu_offload is not None:
-                factor = -1 if reverse else 1
-                cuda_layers = [
-                    (layer_idx + self.num_layers + factor * i) % self.num_layers 
-                    for i in range(self.cpu_offload)]
-                cpu_layers = filter(lambda x: x not in cuda_layers, range(self.num_layers))
-                for lid in cpu_layers:
-                    self.cache[lid].move_to_cpu()
-                for lid in cuda_layers:
-                    self.cache[lid].move_to_cuda()
-    
-        def update(self, layer_idx, key, val):
-            self.visit(layer_idx)
-            return self.cache[layer_idx].update(key, val)
-        
-        def length(self, layer_idx):
-            return self.cache[layer_idx].length()
-        
-        def gather(self, layer_idx):
-            self.visit(layer_idx)
-            return self.cache[layer_idx].gather()
-    
-        def reset(self):
-            if hasattr(self, 'cache'):
-                del self.cache
-            self.cache = [
-                LayerCache(seq_dim=self.seq_dim) 
-                for _ in range(self.num_layers)]
-    
-        def pre_reconstruction(self, idx):
-            for c in self.cache:
-                c.pre_reconstruction(idx)
-    
-        def additive_hook(self, grad, base, layer_idx):
-            self.visit(layer_idx, reverse=True)
-            if base.grad is not None:
-                return grad + base.grad
-            return grad
-    
-        def pre_backward(self, idx):
-            for layer_idx, c in enumerate(self.cache):
-                key, val = c.get(idx)
-                key_bwd, val_bwd = c.get_bwd()
-                key_bwd.register_hook(partial(self.additive_hook, base=key, layer_idx=layer_idx))
-                val_bwd.register_hook(partial(self.additive_hook, base=val, layer_idx=layer_idx))
-    
-        def after_backward(self):
-            for c in self.cache:
-                c.after_backward()
-        
-    
-        def collect_sparse_grad(self, indices):
-            num_chunks = len(self.k_cache[0])
-            assert num_chunks == 1, "Sparse gradient collection does not support multiple chunks."
-    
-            grads = list(chain.from_iterable(chain.from_iterable(self.grad)))
-            num_layers_times_2 = self.num_layers * 2
-    
-            _, num_heads, _, head_dim = grads[0].shape
-    
-            indices = indices[None, :, None, :, None].expand(
-                self.num_layers * 2,
-                -1,
-                num_heads,
-                -1,
-                head_dim)
-    
-            sparse_grad_list = []
-            for i in range(num_layers_times_2):
-                grad_i = grads[i]
-                index_i = indices[i]
-                sparse_i = torch.gather(grad_i, dim=2, index=index_i)
-                sparse_grad_list.append(sparse_i)
-    
-            sparse_gd = _reorganize_list(sparse_grad_list, dim1=num_layers_times_2, dim2=1)
-            sparse_gd = _reorganize_list(sparse_gd, dim1=self.num_layers, dim2=2)
-    
-            return sparse_gd
-    </code>
+
+    def collect_sparse_grad(self, indices):
+        num_chunks = len(self.k_cache[0])
+        assert num_chunks == 1, "Sparse gradient collection does not support multiple chunks."
+
+        grads = list(chain.from_iterable(chain.from_iterable(self.grad)))
+        num_layers_times_2 = self.num_layers * 2
+
+        _, num_heads, _, head_dim = grads[0].shape
+
+        indices = indices[None, :, None, :, None].expand(
+            self.num_layers * 2,
+            -1,
+            num_heads,
+            -1,
+            head_dim)
+
+        sparse_grad_list = []
+        for i in range(num_layers_times_2):
+            grad_i = grads[i]
+            index_i = indices[i]
+            sparse_i = torch.gather(grad_i, dim=2, index=index_i)
+            sparse_grad_list.append(sparse_i)
+
+        sparse_gd = _reorganize_list(sparse_grad_list, dim1=num_layers_times_2, dim2=1)
+        sparse_gd = _reorganize_list(sparse_gd, dim1=self.num_layers, dim2=2)
+
+        return sparse_gd
+</code>
 </details>
 
 <details>
 <summary>The new training step function</summary>
-    <code>
-    def _seco(self, model, inputs):
-        fwd_chunk_size = 512
-        bwd_chunk_size = 512
-        valid_label_count = (inputs['labels'] != -100).sum()
-    
-        # prepare inputs
-        attention_mask, inputs_embeds, labels, _ = _prepare_inputs(model, inputs)
-    
-        # align length across gpus
-        inputs_embeds, labels, attention_mask, _ = _maybe_align_length_across_gpus(
-            inputs_embeds, 
-            labels, 
-            attention_mask,
-            None)
-    
-        inputs_embeds_detach = inputs_embeds.detach()
-        inputs_embeds_detach.requires_grad_(True)
-        labels = torch.cat((labels[:, 1:], torch.full_like(labels[:, :1], fill_value=-100)), dim=-1)
-    
-        # chunkize inputs
+<code>
+def _seco(self, model, inputs):
+    fwd_chunk_size = 512
+    bwd_chunk_size = 512
+    valid_label_count = (inputs['labels'] != -100).sum()
+
+    # prepare inputs
+    attention_mask, inputs_embeds, labels, _ = _prepare_inputs(model, inputs)
+
+    # align length across gpus
+    inputs_embeds, labels, attention_mask, _ = _maybe_align_length_across_gpus(
+        inputs_embeds, 
+        labels, 
+        attention_mask,
+        None)
+
+    inputs_embeds_detach = inputs_embeds.detach()
+    inputs_embeds_detach.requires_grad_(True)
+    labels = torch.cat((labels[:, 1:], torch.full_like(labels[:, :1], fill_value=-100)), dim=-1)
+
+    # chunkize inputs
+    inputs_embeds_list, labels_list, masks_list = _chunkize_inputs(
+        [inputs_embeds_detach, labels, attention_mask],
+        chunk_size=fwd_chunk_size)
+
+    # LLM forward prop
+    accum_loss, seco_cache = _first_forward_prop_seco(
+        model, 
+        inputs_embeds_list, 
+        labels_list, 
+        masks_list, 
+        valid_label_count,
+        cpu_offload=1)
+
+    # maybe change chunk size before backward prop
+    if fwd_chunk_size != bwd_chunk_size:
+        seco_cache.reorganize(bwd_chunk_size)
         inputs_embeds_list, labels_list, masks_list = _chunkize_inputs(
             [inputs_embeds_detach, labels, attention_mask],
-            chunk_size=fwd_chunk_size)
-    
-        # LLM forward prop
-        accum_loss, seco_cache = _first_forward_prop_seco(
-            model, 
-            inputs_embeds_list, 
-            labels_list, 
-            masks_list, 
-            valid_label_count,
-            cpu_offload=1)
-    
-        # maybe change chunk size before backward prop
-        if fwd_chunk_size != bwd_chunk_size:
-            seco_cache.reorganize(bwd_chunk_size)
-            inputs_embeds_list, labels_list, masks_list = _chunkize_inputs(
-                [inputs_embeds_detach, labels, attention_mask],
-                chunk_size=bwd_chunk_size,)
-    
-        # LLM backward prop
-        generator = reversed(list(enumerate(zip(inputs_embeds_list, labels_list))))
-        for i, (chunk_embeds, chunk_labels) in generator:
-            tmp_cache = seco_cache.index(i)
-            seco_cache.delete(i)
-            outputs = model(
-                input_ids=None,
-                attention_mask=torch.cat(masks_list[:i+1], dim=1),
-                inputs_embeds=chunk_embeds,
-                labels=chunk_labels,
-                past_key_values=seco_cache,
-                shift_label=False,
-                is_reduce=False)
-            loss = outputs['loss'].sum() / valid_label_count
-            seco_cache.link_grad(tmp_cache, i)
-            _backward(loss, model)
-            seco_cache.delete(i)
-            del tmp_cache
-    
-        inputs_embeds.register_hook(partial(
-            _set_to_incomming_grad, 
-            incomming_grad=inputs_embeds_detach.grad))
-        _backward(inputs_embeds.sum(), model)
-        _step(model, self.optimizer)
-    
-        return accum_loss / self.args.gradient_accumulation_steps
-    </code>
+            chunk_size=bwd_chunk_size,)
+
+    # LLM backward prop
+    generator = reversed(list(enumerate(zip(inputs_embeds_list, labels_list))))
+    for i, (chunk_embeds, chunk_labels) in generator:
+        tmp_cache = seco_cache.index(i)
+        seco_cache.delete(i)
+        outputs = model(
+            input_ids=None,
+            attention_mask=torch.cat(masks_list[:i+1], dim=1),
+            inputs_embeds=chunk_embeds,
+            labels=chunk_labels,
+            past_key_values=seco_cache,
+            shift_label=False,
+            is_reduce=False)
+        loss = outputs['loss'].sum() / valid_label_count
+        seco_cache.link_grad(tmp_cache, i)
+        _backward(loss, model)
+        seco_cache.delete(i)
+        del tmp_cache
+
+    inputs_embeds.register_hook(partial(
+        _set_to_incomming_grad, 
+        incomming_grad=inputs_embeds_detach.grad))
+    _backward(inputs_embeds.sum(), model)
+    _step(model, self.optimizer)
+
+    return accum_loss / self.args.gradient_accumulation_steps
+</code>
 </details>
 
 
