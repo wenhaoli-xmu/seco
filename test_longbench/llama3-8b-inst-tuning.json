@@ -20,27 +20,27 @@
         "weight_decay": 0.05,
         "corpus": [
             {
-                "data": "/data/lwh/activation-beacon-new/gpt/one_detail_book.train.8K.json",
+                "data": "/data/anoymous/activation-beacon-new/gpt/one_detail_book.train.8K.json",
                 "conf": "config/conversation_trunc16k.json",
                 "partition": 0.2
             },
             {
-                "data": "/data/lwh/activation-beacon-new/gpt/one_detail_paper.train.8K.json",
+                "data": "/data/anoymous/activation-beacon-new/gpt/one_detail_paper.train.8K.json",
                 "conf": "config/conversation_trunc16k.json",
                 "partition": 0.2
             },
             {
-                "data": "/data/lwh/activation-beacon-new/longalpaca/train.json",
+                "data": "/data/anoymous/activation-beacon-new/longalpaca/train.json",
                 "conf": "config/conversation_trunc16k.json",
                 "partition": 0.2
             },
             {
-                "data": "/data/lwh/activation-beacon-new/booksum/train.8K.json",
+                "data": "/data/anoymous/activation-beacon-new/booksum/train.8K.json",
                 "conf": "config/conversation_trunc16k.json",
                 "partition": 0.2
             },
             {
-                "data": "/data/lwh/activation-beacon-new/needle/train.8K.json",
+                "data": "/data/anoymous/activation-beacon-new/needle/train.8K.json",
                 "conf": "config/conversation_trunc16k.json",
                 "partition": 0.2
             }
