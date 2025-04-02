@@ -85,9 +85,9 @@ def get_pred(
         ).ravel().tolist()
 
         # NOTE: 新增加
-        if tokenizer.eos_token_id in output:
-            index = output.index(tokenizer.eos_token_id)
-            output = output[:index]
+        # if tokenizer.eos_token_id in output:
+        #     index = output.index(tokenizer.eos_token_id)
+        #     output = output[:index]
         torch.cuda.empty_cache()
 
         pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
