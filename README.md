@@ -6,7 +6,7 @@
 
 This training is running on 8 * A100 GPUs, using Deepspeed zero2 optimization. The base model is LLaMA3-8B and we full finetune its parameters on the official instruct tuning dataset of LLaVA-HR.
 
-![img](mllm.jpg)
+![img](mllm.png)
 ![img](docs/timecost.png)
 
 We used our new implementation, which supports kv cache offloading, to run this experiments. The core codes are listed as follows:
