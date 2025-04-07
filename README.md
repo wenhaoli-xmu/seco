@@ -9,8 +9,6 @@ This training is running on 8 * A100 GPUs, using Deepspeed zero2 optimization. T
 ![img](mllm.png)
 ![img](docs/timecost.png)
 
-We used our new implementation, which supports kv cache offloading, to run this experiments. The core codes are listed as follows:
-
 ## 🤖Inst-Tuning Results
 
 To more comprehensively validate the performance of SeCO and SpaCO, we further compared them with model parallel (running on 4 RTX 3090 GPUs, utilizing gradient checkpointing) in the instruction fine-tuning task. The results are shown in the figure below:
