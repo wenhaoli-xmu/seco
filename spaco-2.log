@@ -8,7 +8,7 @@ Loading checkpoint shards:  50%|█████     | 2/4 [00:02<00:02,  1.21s/i
 Loading checkpoint shards:  75%|███████▌  | 3/4 [00:03<00:01,  1.21s/it]
 Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.15it/s]
 Loading checkpoint shards: 100%|██████████| 4/4 [00:03<00:00,  1.00it/s]
-/home/lwh/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
+/home/anonymous/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
 You can avoid this message in future by passing the argument `trust_remote_code=True`.
 Passing `trust_remote_code=True` will be mandatory to load this dataset from the next major release of `datasets`.
   warnings.warn(
@@ -222,7 +222,7 @@ lora:
 100%|█████████▉| 199/200 [23:37<00:07,  7.08s/it]
 100%|██████████| 200/200 [23:46<00:00,  7.60s/it]
 100%|██████████| 200/200 [23:46<00:00,  7.13s/it]
-/home/lwh/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
+/home/anonymous/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
 You can avoid this message in future by passing the argument `trust_remote_code=True`.
 Passing `trust_remote_code=True` will be mandatory to load this dataset from the next major release of `datasets`.
   warnings.warn(
@@ -4837,7 +4837,7 @@ Passing `trust_remote_code=True` will be mandatory to load this dataset from the
 100%|██████████| 500/500 [42:45<00:00,  5.76s/it]
 100%|██████████| 500/500 [42:45<00:00,  5.13s/it]
 Evaluating model for inst-tuning-spaco-2 ...
-/home/lwh/miniconda3/envs/genacc/lib/python3.10/site-packages/fuzzywuzzy/fuzz.py:11: UserWarning: Using slow pure-python SequenceMatcher. Install python-Levenshtein to remove this warning
+/home/anonymous/miniconda3/envs/genacc/lib/python3.10/site-packages/fuzzywuzzy/fuzz.py:11: UserWarning: Using slow pure-python SequenceMatcher. Install python-Levenshtein to remove this warning
   warnings.warn('Using slow pure-python SequenceMatcher. Install python-Levenshtein to remove this warning')
 Building prefix dict from the default dictionary ...
 Loading model from cache /tmp/jieba.cache
