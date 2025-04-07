@@ -1,4 +1,4 @@
-bash: /home/anoymous/miniconda3/envs/genacc/lib/libtinfo.so.6: no version information available (required by bash)
+bash: /home/anonymous/miniconda3/envs/genacc/lib/libtinfo.so.6: no version information available (required by bash)
 Running prediction for inst-tuning-spaco-0 ...
 
 Loading checkpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]
@@ -7,7 +7,7 @@ Loading checkpoint shards:  50%|█████     | 2/4 [00:02<00:02,  1.20s/i
 Loading checkpoint shards:  75%|███████▌  | 3/4 [00:05<00:02,  2.03s/it]
 Loading checkpoint shards: 100%|██████████| 4/4 [00:06<00:00,  1.53s/it]
 Loading checkpoint shards: 100%|██████████| 4/4 [00:06<00:00,  1.55s/it]
-/home/anoymous/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
+/home/anonymous/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
 You can avoid this message in future by passing the argument `trust_remote_code=True`.
 Passing `trust_remote_code=True` will be mandatory to load this dataset from the next major release of `datasets`.
   warnings.warn(
@@ -221,7 +221,7 @@ lora:
 100%|█████████▉| 199/200 [20:20<00:06,  6.49s/it]
 100%|██████████| 200/200 [20:29<00:00,  7.27s/it]
 100%|██████████| 200/200 [20:29<00:00,  6.15s/it]
-/home/anoymous/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
+/home/anonymous/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
 You can avoid this message in future by passing the argument `trust_remote_code=True`.
 Passing `trust_remote_code=True` will be mandatory to load this dataset from the next major release of `datasets`.
   warnings.warn(
@@ -4836,7 +4836,7 @@ Passing `trust_remote_code=True` will be mandatory to load this dataset from the
 100%|██████████| 500/500 [50:18<00:00,  5.82s/it]
 100%|██████████| 500/500 [50:18<00:00,  6.04s/it]
 Evaluating model for inst-tuning-spaco-0 ...
-/home/anoymous/miniconda3/envs/genacc/lib/python3.10/site-packages/fuzzywuzzy/fuzz.py:11: UserWarning: Using slow pure-python SequenceMatcher. Install python-Levenshtein to remove this warning
+/home/anonymous/miniconda3/envs/genacc/lib/python3.10/site-packages/fuzzywuzzy/fuzz.py:11: UserWarning: Using slow pure-python SequenceMatcher. Install python-Levenshtein to remove this warning
   warnings.warn('Using slow pure-python SequenceMatcher. Install python-Levenshtein to remove this warning')
 Building prefix dict from the default dictionary ...
 Loading model from cache /tmp/jieba.cache
