@@ -1,19 +1,19 @@
-bash: /home/anoymous/miniconda3/envs/genacc/lib/libtinfo.so.6: no version information available (required by bash)
+bash: /home/anonymous/miniconda3/envs/genacc/lib/libtinfo.so.6: no version information available (required by bash)
 Running prediction for inst-tuning-parallel-3 ...
 
-Loadinanoymousheckpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]
+Loadinanonymousheckpoint shards:   0%|          | 0/4 [00:00<?, ?it/s]
 Loading checkpoint shards:  25%|██▌       | 1/4 [00:01<00:04,  1.43s/it]
 Loading checkpoint shards:  50%|█████     | 2/4 [00:02<00:02,  1.45s/it]
 Loading checkpoint shards:  75%|███████▌  | 3/4 [00:04<00:01,  1.46s/it]
 Loading checkpoint shards: 100%|██████████| 4/4 [00:04<00:00,  1.01s/it]
 Loading checkpoint shards: 100%|██████████| 4/4 [00:04<00:00,  1.17s/it]
-/home/lwh/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
+/home/anonymous/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
 You can avoid this message in future by passing the argument `trust_remote_code=True`.
 Passing `trust_remote_code=True` will be mandatory to load this dataset from the next major release of `datasets`.
   warnings.warn(
 ======================================== Config ========================================
 lora: 
-    enanoymouse: true,
+    enanonymouse: true,
     r: 8,
     a: 16,
     dropout: 0
@@ -38,7 +38,7 @@ lora:
   8%|▊         | 16/200 [01:54<22:09,  7.22s/it]
   8%|▊         | 17/200 [02:00<20:17,  6.65s/it]
   9%|▉         | 18/200 [02:09<22:27,  7.41s/it]
- 10%|▉anoymous      | 19/200 [02:18<23:54,  7.92s/it]
+ 10%|▉anonymous      | 19/200 [02:18<23:54,  7.92s/it]
  10%|█         | 20/200 [02:21<19:21,  6.45s/it]
  10%|█         | 21/200 [02:30<21:38,  7.25s/it]
  11%|█         | 22/200 [02:33<17:52,  6.03s/it]
@@ -221,7 +221,7 @@ lora:
 100%|█████████▉| 199/200 [19:45<00:06,  6.35s/it]
 100%|██████████| 200/200 [19:48<00:00,  5.45s/it]
 100%|██████████| 200/200 [19:48<00:00,  5.94s/it]
-/home/lwh/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
+/home/anonymous/miniconda3/envs/genacc/lib/python3.10/site-packages/datasets/load.py:922: FutureWarning: The repository for LongBench contains custom code which must be executed to correctly load the dataset. You can inspect the repository content at LongBench/LongBench.py
 You can avoid this message in future by passing the argument `trust_remote_code=True`.
 Passing `trust_remote_code=True` will be mandatory to load this dataset from the next major release of `datasets`.
   warnings.warn(
@@ -4836,7 +4836,7 @@ Passing `trust_remote_code=True` will be mandatory to load this dataset from the
 100%|██████████| 500/500 [48:50<00:00,  6.59s/it]
 100%|██████████| 500/500 [48:50<00:00,  5.86s/it]
 test_longbench/eval.sh: line 9: o: command not found
-/home/lwh/miniconda3/envs/genacc/lib/python3.10/site-packages/fuzzywuzzy/fuzz.py:11: UserWarning: Using slow pure-python SequenceMatcher. Install python-Levenshtein to remove this warning
+/home/anonymous/miniconda3/envs/genacc/lib/python3.10/site-packages/fuzzywuzzy/fuzz.py:11: UserWarning: Using slow pure-python SequenceMatcher. Install python-Levenshtein to remove this warning
   warnings.warn('Using slow pure-python SequenceMatcher. Install python-Levenshtein to remove this warning')
 Building prefix dict from the default dictionary ...
 Loading model from cache /tmp/jieba.cache
