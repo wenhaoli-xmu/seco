@@ -1,5 +1,3 @@
-export HF_ACCESS_TOKEN=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
-
 torchrun \
     --rdzv-backend=c10d \
     --rdzv-endpoint=localhost:14341 \

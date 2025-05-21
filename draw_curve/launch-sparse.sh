@@ -1,6 +1,3 @@
-export HF_ACCESS_TOKEN=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
-export CUDA_LAUNCH_BLOCKING=1
-
 MASTER_ADDR=`scontrol show hostname $SLURM_JOB_NODELIST | head -n1`
 MASTER_PORT=$((RANDOM % 101 + 20000))
 
