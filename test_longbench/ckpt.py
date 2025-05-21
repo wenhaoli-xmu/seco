@@ -1,5 +1,6 @@
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, DistributedSampler
 import torch.distributed as dist
+
 
 import torch
 
@@ -14,6 +15,7 @@ from chunkoptim.utils import (
 
 import argparse, random, numpy, os, json
 from pygments.console import colorize
+import deepspeed
 
 
 def zero_grad(params):
@@ -67,10 +69,7 @@ def seed_everything(seed):
 
 
 def backend_setup():
-    local_rank = int(os.environ['LOCAL_RANK'])
-    world_size = int(os.environ['WORLD_SIZE'])
-    dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
-    torch.cuda.set_device(local_rank)
+    deepspeed.init_distributed()
 
 
 def backend_cleanup():
@@ -78,44 +77,34 @@ def backend_cleanup():
 
 
 if __name__ == '__main__':
-
-
     backend_setup()
-
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-conf", type=str, required=True)
-
-    # others
     parser.add_argument("--log-step", type=int, default=100)
     parser.add_argument("--accum-grad", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--load-ckpt", type=str, default=None)
     parser.add_argument("--save-ckpt", type=str, default=None)
-
+    parser.add_argument("--local_rank", type=int, default=-1)
+    parser = deepspeed.add_config_arguments(parser)
     args = parser.parse_args()
-
     
     env_conf = get_env_conf(args.env_conf)
     env_conf['train']['max_lr'] = args.lr
     dtype = get_torch_dtype(env_conf['model']['model_dtype'])
-
 
     # load model
     seed_everything(0)
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
     seed_everything(args.seed)
 
-    model.eval()
-
     if args.load_ckpt is not None:
         model.load_checkpoint(args.load_ckpt)
 
-
     params = model.ft_params()
     optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(**env_conf['train'], params=params)
-
 
     # build dataset
     """
@@ -130,11 +119,18 @@ if __name__ == '__main__':
     dist.barrier()
 
 
+    sampler = DistributedSampler(corpus, rank=dist.get_rank(), shuffle=True, seed=args.seed)
     loader = DataLoader(
         corpus, 
         batch_size=1, 
         collate_fn=collate_fn,
-        shuffle=True)
+        sampler=sampler)
+    
+    model_engine, _, _, _ = deepspeed.initialize(
+        args=args,
+        model=model,
+        optimizer=optimizer,
+        model_parameters=params)
 
 
     base_memory_allocated = torch.cuda.max_memory_allocated()
@@ -151,26 +147,22 @@ if __name__ == '__main__':
         history.init()
         
         # forward pass & backward pass
-        loss = model(
+        loss = model_engine(
             input_ids=batch['input_ids'],
             labels=batch['labels'])
         loss = loss.sum() / batch['seq_len']
-        loss.backward()
+        model_engine.backward(loss)
 
         # log history
         history.step(loss.item(), batch['seq_len'])
+        model_engine.step()
 
-        if (step + 1) % args.accum_grad == 0:
-            optimizer.step()
-            zero_grad(params)
-
-    output = json.dumps(history.loss)
-    print(output)
-
+    if dist.get_rank() == 0:
+        output = json.dumps(history.loss)
+        print(output)
 
     # save model
-    if args.save_ckpt is not None:
+    if dist.get_rank() == 0 and args.save_ckpt is not None:
         model.save_checkpoint(args.save_ckpt)
-
 
     backend_cleanup()

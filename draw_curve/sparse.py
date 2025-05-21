@@ -11,7 +11,8 @@ from chunkoptim.utils import (
     get_torch_dtype,
     get_optimizer_and_lr_adjuster, 
     chunkize,
-    ListCache,
+    NestCache,
+    build_mixed_float_mask,
     History)
 
 import argparse, random, numpy, os, json
@@ -51,10 +52,12 @@ def collate_fn(batch):
     labels = labels.unsqueeze(0)
 
     seq_len = input_ids.shape[-1]
+    attention_mask = torch.ones_like(input_ids, dtype=torch.int64)
 
     return dict(
         input_ids=input_ids,
         labels=labels,
+        attention_mask=attention_mask,
         seq_len=seq_len)
 
 
@@ -69,6 +72,29 @@ def backend_setup():
     world_size = int(os.environ['WORLD_SIZE'])
     dist.init_process_group("nccl", rank=local_rank, world_size=world_size)
     torch.cuda.set_device(local_rank)
+
+
+def prepare_for_sparse_backward(input_ids, labels, chunk_size, chunk_budget):
+    assert input_ids.shape[0] == 1
+    seq_len = input_ids.shape[-1]
+
+    token_budget = chunk_size * chunk_budget
+    token_budget = min(token_budget, seq_len)
+
+    indices = torch.randperm(seq_len, device='cuda')[:token_budget].sort().values
+    indices = indices.unsqueeze(0)
+
+    input_ids = torch.gather(input_ids, 1, indices)
+    labels = torch.gather(labels, -1, indices)
+
+    assert input_ids.ndim == 2
+
+    indices = chunkize(indices, -1, args.chunk_size)
+    input_ids = chunkize(input_ids, -1, args.chunk_size)
+    labels = chunkize(labels, -1, args.chunk_size)
+
+    return indices, input_ids, labels, token_budget
+    
 
 
 def backend_cleanup():
@@ -86,6 +112,7 @@ if __name__ == '__main__':
     
     # algorithm related arguments
     parser.add_argument("--chunk-size", type=int, default=128)
+    parser.add_argument("--chunk-budget", type=int, default=1)
 
     # others
     parser.add_argument("--log-step", type=int, default=100)
@@ -107,9 +134,7 @@ if __name__ == '__main__':
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
     seed_everything(args.seed)
 
-
     model.eval()
-
 
     params = model.ft_params()
     optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(**env_conf['train'], params=params)
@@ -133,7 +158,6 @@ if __name__ == '__main__':
         batch_size=1, 
         collate_fn=collate_fn)
 
-
     base_memory_allocated = torch.cuda.max_memory_allocated()
     print(colorize("yellow", "Base GPU memory allocated:") + colorize("green", f"{base_memory_allocated // 1024 ** 2} MB"))
     history = History(args.log_step)
@@ -141,38 +165,43 @@ if __name__ == '__main__':
     for step, batch in enumerate(loader):
         lr_adjuster(step=step)
 
-        input_ids = list(chunkize(batch['input_ids'], -1, args.chunk_size))
-        labels = list(chunkize(batch['labels'], -1, args.chunk_size))
-        kv_cache = ListCache(model.num_layers, cpu_offload=1, seq_dim=1)
+        input_ids, labels = batch['input_ids'], batch['labels']
+        input_ids_fwd = list(chunkize(input_ids, -1, args.chunk_size))
+        labels_fwd = list(chunkize(labels, -1, args.chunk_size))
+        kv_cache = NestCache(model.num_layers, cpu_offload=1, seq_dim=1)
 
         history.init()
+        accum_loss = 0
         
         with torch.no_grad():
-            for chunk_input, chunk_target in zip(input_ids, labels):
-
-                # forward pass
+            for chunk_input, chunk_target in zip(input_ids_fwd, labels_fwd):
                 inputs = dict(
                     input_ids=chunk_input,
                     labels=chunk_target,
                     kv_cache=kv_cache)
-                model(**inputs)
+                loss = model(**inputs).sum() / batch['seq_len']
+                accum_loss += loss.item()
 
-        accum_loss = 0
+        # prepare for sparse backward
+        indices, input_ids_bwd, labels_bwd, budget = prepare_for_sparse_backward(
+            batch['input_ids'], 
+            batch['labels'], 
+            args.chunk_size, 
+            args.chunk_budget)
 
-        for i, (chunk_input, chunk_target) in reversed(list(enumerate(zip(input_ids, labels)))):
+        for chunk_indices, chunk_input, chunk_target in reversed(list(zip(indices, input_ids_bwd, labels_bwd))):
 
-            kv_cache.pre_recon(i)
+            mixed_mask = build_mixed_float_mask(batch['seq_len'], chunk_indices)
 
-            # forward prop
             inputs = dict(
                 input_ids=chunk_input,
                 labels=chunk_target,
-                kv_cache=kv_cache)
+                kv_cache=kv_cache,
+                attention_mask=mixed_mask)
 
-            loss = model(**inputs).sum() / batch['seq_len']
-            accum_loss += loss.item()
+            loss = model(**inputs).sum() / budget
 
-            # kv_cache.pre_backward(i)
+            kv_cache.pre_backward(chunk_indices)
             loss.backward()
             kv_cache.after_backward()
 

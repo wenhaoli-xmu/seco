@@ -20,7 +20,7 @@
         "corpus": [
             {
                 "data": "data/pg19/train.json",
-                "conf": "config/slimpajama-trunc15360.json",
+                "conf": "config/slimpajama-trunc16384.json",
                 "partition": 1.0
             }
         ]

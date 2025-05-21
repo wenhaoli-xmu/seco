@@ -12,6 +12,37 @@ import time
 
 from itertools import chain
 from profiler import WallTime
+from abc import abstractmethod
+
+
+def build_mixed_float_mask(seq_len, chunk_indices):
+    """
+    Arguments
+    ---------
+    mask_4d: [1, 1, seqlen_q, seqlen_k]
+    chunk_indices: [1, chunk_size]
+
+    Return
+    ------
+    mixed_mask
+    """
+    window_size = chunk_indices.shape[-1]
+    chunk_mask_4d = torch.where(
+        torch.arange(seq_len, device=chunk_indices.device)[None, None, None, :] <= chunk_indices[:, None, :, None],
+        0,
+        float('-inf'))
+    chunk_mask_4d.scatter_(
+        dim=-1, 
+        index=chunk_indices[:, None, None, :].expand(-1, -1, window_size, -1), 
+        value=float('-inf'))
+    pad_mask_4d = torch.full(
+        size=(window_size, window_size), 
+        fill_value=float('-inf'),
+        dtype=chunk_mask_4d.dtype, 
+        device=chunk_mask_4d.device)
+    pad_mask_4d = pad_mask_4d.triu(1)[None, None, :, :].expand(chunk_mask_4d.shape[0], -1, -1, -1)
+    mixed_mask_4d = torch.cat([chunk_mask_4d, pad_mask_4d], dim=-1)
+    return mixed_mask_4d
 
 
 def average_filter(x, window):
@@ -154,32 +185,29 @@ def get_optimizer_and_lr_adjuster(max_lr, train_iters, warmup, weight_decay, bet
     return optim, lr_adjuster
 
 
-def _reorganize_list(x, dim1, dim2):
-    y = []
-    for i in range(dim1):
-        y.append([])
-        for j in range(dim2):
-            y[-1].append(x[i * dim2 + j])
-    return y
+def check_not_nest(func):
+    def wrapper(self, *args, **kwargs):
+        assert self.is_nest is False, "this operation could not be conducted under nest mode"
+        return func(self, *args, **kwargs)
+    return wrapper
+
+
+def check_nest(func):
+    def wrapper(self, *args, **kwargs):
+        assert self.is_nest is True, "this operation must be conducted under nest mode"
+        return func(self, *args, **kwargs)
+    return wrapper
 
 
 class LayerCache(torch.nn.Module):
-    def __init__(self, seq_dim=-2):
-        super().__init__()
+    def __init__(self, seq_dim):
         self.seq_dim = seq_dim
+        super().__init__()
         self.reset()
 
+    @abstractmethod
     def reset(self):
-        self.keys = torch.nn.ParameterList()
-        self.vals = torch.nn.ParameterList()
-        self.current_device = 'cuda'
-        self.key_bwd = None
-        self.val_bwd = None
-        self.visible_range = None
-
-    def append(self, key, val):
-        self.keys.append(torch.nn.Parameter(key, requires_grad=False))
-        self.vals.append(torch.nn.Parameter(val, requires_grad=False))
+        raise NotImplementedError
 
     def move_to_cpu(self):
         if self.current_device != 'cpu':
@@ -191,6 +219,28 @@ class LayerCache(torch.nn.Module):
             self.to('cuda', non_blocking=True)
         self.current_device = 'cuda'
 
+
+class ListLayerCache(LayerCache):
+    def delete_rear(self):
+        self.keys, key = self.keys[:-1], self.keys[-1]
+        self.vals, val = self.vals[:-1], self.vals[-1]
+        del key, val
+
+    def get(self, idx):
+        return self.keys[idx], self.vals[idx]
+
+    def reset(self):
+        self.current_device = 'cuda'
+        self.key_bwd = None
+        self.val_bwd = None
+        self.visible_range = None
+        self.keys = torch.nn.ParameterList()
+        self.vals = torch.nn.ParameterList()
+
+    def append(self, key, val):
+        self.keys.append(torch.nn.Parameter(key, requires_grad=True))
+        self.vals.append(torch.nn.Parameter(val, requires_grad=True))
+    
     def length(self):
         if self.visible_range is not None:
             past_keys = self.keys[:self.visible_range]
@@ -201,15 +251,12 @@ class LayerCache(torch.nn.Module):
     def gather(self):
         past_keys = self.keys if self.visible_range is None else self.keys[:self.visible_range]
         past_vals = self.vals if self.visible_range is None else self.vals[:self.visible_range]
+        past_keys += (self.key_bwd,)
+        past_vals += (self.val_bwd,)
         return (
             torch.cat([*past_keys], dim=self.seq_dim),
             torch.cat([*past_vals], dim=self.seq_dim))
-    
-    def delete_rear(self):
-        self.keys, key = self.keys[:-1], self.keys[-1]
-        self.vals, val = self.vals[:-1], self.vals[-1]
-        del key, val
-    
+
     def update(self, key, val):
         try:
             past_keys = self.keys if self.visible_range is None else self.keys[:self.visible_range]
@@ -223,14 +270,11 @@ class LayerCache(torch.nn.Module):
             else:
                 self.key_bwd = key
                 self.val_bwd = val
-
-    def get(self, idx):
-        return self.keys[idx], self.vals[idx]
     
     def get_bwd(self):
         return self.key_bwd, self.val_bwd
-
-    def pre_reconstruction(self, idx):
+    
+    def pre_recon(self, idx):
         self.visible_range = idx
 
     def after_backward(self):
@@ -241,12 +285,68 @@ class LayerCache(torch.nn.Module):
         self.delete_rear()
 
 
-class SecoCache:
+class NestLayerCache(LayerCache):
+    def reset(self):
+        self.current_device = 'cuda'
+        self.key_bwd = None
+        self.val_bwd = None
+        self.keys = None
+        self.vals = None
+
+    def append(self, key, val):
+        if self.keys is None:
+            self.keys = torch.nn.Parameter(key, requires_grad=True)
+            self.vals = torch.nn.Parameter(val, requires_grad=True)
+        else:
+            self.keys.data = torch.cat((self.keys.data, key.data), dim=self.seq_dim)
+            self.vals.data = torch.cat((self.vals.data, val.data), dim=self.seq_dim)
+
+    def length(self):
+        return self.keys.shape[self.seq_dim] if self.keys is not None else 0
+    
+    def get(self):
+        return self.keys, self.vals
+    
+    def gather(self):
+        return (
+            torch.cat((self.keys, self.key_bwd), dim=self.seq_dim),
+            torch.cat((self.vals, self.val_bwd), dim=self.seq_dim))
+
+    def update(self, key, val):
+        try:
+            if self.keys is not None:
+                ret_keys = torch.cat([self.keys, key], dim=self.seq_dim)
+                ret_vals = torch.cat([self.vals, val], dim=self.seq_dim)
+            else:
+                ret_keys = key
+                ret_vals = val
+            return ret_keys, ret_vals
+        finally:
+            if not torch.is_grad_enabled():
+                self.append(key, val)
+            else:
+                self.key_bwd = key
+                self.val_bwd = val
+
+    def get_bwd(self):
+        return self.key_bwd, self.val_bwd
+
+    def after_backward(self):
+        del self.key_bwd, self.val_bwd
+        self.key_bwd = None
+        self.val_bwd = None
+
+
+class KVCache:
     def __init__(self, num_layers, cpu_offload=None, seq_dim=-2):
         self.num_layers = num_layers    
         self.cpu_offload = cpu_offload
         self.seq_dim = seq_dim
         self.reset()
+
+    @abstractmethod
+    def reset(self):
+        raise NotImplementedError
 
     def visit(self, layer_idx, reverse=False):
         if self.cpu_offload is not None:
@@ -260,6 +360,13 @@ class SecoCache:
             for lid in cuda_layers:
                 self.cache[lid].move_to_cuda()
 
+    @property
+    def device(self):
+        d = []
+        for c in self.cache:
+            d.append(next(c.parameters()).device)
+        return d
+
     def update(self, layer_idx, key, val):
         self.visit(layer_idx)
         return self.cache[layer_idx].update(key, val)
@@ -271,16 +378,14 @@ class SecoCache:
         self.visit(layer_idx)
         return self.cache[layer_idx].gather()
 
+
+class ListCache(KVCache):
     def reset(self):
         if hasattr(self, 'cache'):
             del self.cache
         self.cache = [
-            LayerCache(seq_dim=self.seq_dim) 
+            ListLayerCache(seq_dim=self.seq_dim) 
             for _ in range(self.num_layers)]
-
-    def pre_reconstruction(self, idx):
-        for c in self.cache:
-            c.pre_reconstruction(idx)
 
     def additive_hook(self, grad, base, layer_idx):
         self.visit(layer_idx, reverse=True)
@@ -295,38 +400,48 @@ class SecoCache:
             key_bwd.register_hook(partial(self.additive_hook, base=key, layer_idx=layer_idx))
             val_bwd.register_hook(partial(self.additive_hook, base=val, layer_idx=layer_idx))
 
+    def pre_recon(self, idx):
+        for c in self.cache:
+            c.pre_recon(idx)
+
     def after_backward(self):
         for c in self.cache:
             c.after_backward()
+
+
+class NestCache(KVCache):
+    def reset(self):
+        if hasattr(self, 'cache'):
+            del self.cache
+        self.cache = [
+            NestLayerCache(seq_dim=self.seq_dim) 
+            for _ in range(self.num_layers)]
     
+    def additive_hook(self, grad, base, layer_idx, indices):
+        self.visit(layer_idx, reverse=True)
+        if base.grad is not None:
+            if self.seq_dim == 1:
+                indices = indices[:, :, None, None]
+                indices = indices.expand(-1, -1, grad.shape[2], grad.shape[3])
+            elif self.seq_dim == 2:
+                indices = indices[:, None, :, None]
+                indices = indices.expand(-1, grad.shape[1], -1, grad.shape[3])
+            else:
+                raise NotImplementedError
+            delta = torch.gather(base.grad.data, dim=self.seq_dim, index=indices)
+            return grad + delta
+        return grad
 
-    def collect_sparse_grad(self, indices):
-        num_chunks = len(self.k_cache[0])
-        assert num_chunks == 1, "Sparse gradient collection does not support multiple chunks."
+    def pre_backward(self, indices):
+        for layer_idx, c in enumerate(self.cache):
+            keys, vals = c.get()
+            key_bwd, val_bwd = c.get_bwd()
+            key_bwd.register_hook(partial(self.additive_hook, base=keys, layer_idx=layer_idx, indices=indices))
+            val_bwd.register_hook(partial(self.additive_hook, base=vals, layer_idx=layer_idx, indices=indices))
 
-        grads = list(chain.from_iterable(chain.from_iterable(self.grad)))
-        num_layers_times_2 = self.num_layers * 2
-
-        _, num_heads, _, head_dim = grads[0].shape
-
-        indices = indices[None, :, None, :, None].expand(
-            self.num_layers * 2,
-            -1,
-            num_heads,
-            -1,
-            head_dim)
-
-        sparse_grad_list = []
-        for i in range(num_layers_times_2):
-            grad_i = grads[i]
-            index_i = indices[i]
-            sparse_i = torch.gather(grad_i, dim=2, index=index_i)
-            sparse_grad_list.append(sparse_i)
-
-        sparse_gd = _reorganize_list(sparse_grad_list, dim1=num_layers_times_2, dim2=1)
-        sparse_gd = _reorganize_list(sparse_gd, dim1=self.num_layers, dim2=2)
-
-        return sparse_gd
+    def after_backward(self):
+        for c in self.cache:
+            c.after_backward()
 
 
 def average_filter(x, window):
@@ -375,7 +490,7 @@ class History:
 
     def summary(self, pr1nt=True):
 
-        times = self.time[3:]
+        times = self.time
         min_time = min(times) if len(times) > 0 else 0.0
         min_memory = min(self.memory) / 1024 ** 2
 
@@ -405,4 +520,5 @@ class History:
         dist.barrier()
 
         return min_time, min_memory
+
 

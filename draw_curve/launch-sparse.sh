@@ -1,4 +1,5 @@
 export HF_ACCESS_TOKEN=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
+export CUDA_LAUNCH_BLOCKING=1
 
 MASTER_ADDR=`scontrol show hostname $SLURM_JOB_NODELIST | head -n1`
 MASTER_PORT=$((RANDOM % 101 + 20000))
@@ -8,7 +9,7 @@ torchrun \
     --rdzv-endpoint=${MASTER_ADDR}:${MASTER_PORT} \
     --nnodes 1 \
     --nproc_per_node 1 \
-    draw_curve/seco.py \
+    draw_curve/sparse.py \
     --env-conf draw_curve/llama3-8b.json \
     --accum-grad 4 \
     --chunk-size 2048 \

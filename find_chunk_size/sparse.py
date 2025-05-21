@@ -10,8 +10,11 @@ from chunkoptim.utils import (
     get_env_conf, 
     get_torch_dtype,
     get_optimizer_and_lr_adjuster, 
-    SecoCache,
-    History)
+    NestCache,
+    chunkize,
+    History,
+    build_mixed_float_mask,
+    build_4d_float_mask)
 
 import argparse, random, numpy, os
 from functools import partial
@@ -75,14 +78,42 @@ def backend_cleanup():
     dist.destroy_process_group()
 
 
+def prepare_for_sparse_backward(input_ids, labels, chunk_size, chunk_budget):
+    assert input_ids.shape[0] == 1
+    seq_len = input_ids.shape[-1]
+
+    token_budget = chunk_size * chunk_budget
+    token_budget = min(token_budget, seq_len)
+
+    indices = torch.randperm(seq_len, device='cuda')[:token_budget].sort().values
+    indices = indices.unsqueeze(0)
+
+    input_ids = torch.gather(input_ids, 1, indices)
+    labels = torch.gather(labels, -1, indices)
+
+    assert input_ids.ndim == 2
+
+    indices = chunkize(indices, -1, chunk_size)
+    input_ids = chunkize(input_ids, -1, chunk_size)
+    labels = chunkize(labels, -1, chunk_size)
+
+    return indices, input_ids, labels, token_budget
+
+
 if __name__ == '__main__':
+
+
     backend_setup()
+
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-conf", type=str, required=True)
     
     # algorithm related arguments
-    parser.add_argument("--context", type=str, default="[512,1024,2048,3072,4096,5120,6144,7168,8192,9216,10240,11264,12288,13312,14336,15360,16384]")
+    parser.add_argument("--chunk-size", type=str, default='[512 * (i + 1) for i in range(8)]')
+    parser.add_argument("--chunk-budget", type=int, default=1)
+    parser.add_argument("--context", type=int, default=32768)
+    parser.add_argument("--cpu-offload", action='store_true')
 
     # others
     parser.add_argument("--log-step", type=int, default=100)
@@ -95,8 +126,7 @@ if __name__ == '__main__':
     env_conf['model']['device_map'] = {"": dist.get_rank()}
     dtype = get_torch_dtype(env_conf['model']['model_dtype'])
 
-    import json
-    args.context = json.loads(args.context)
+    args.chunk_size = eval(args.chunk_size)
 
 
     # load model
@@ -104,9 +134,7 @@ if __name__ == '__main__':
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
     seed_everything(dist.get_rank())
 
-
     model.train()
-
 
     params = model.ft_params()
     optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(**env_conf['train'], params=params)
@@ -130,36 +158,69 @@ if __name__ == '__main__':
         batch_size=1, 
         collate_fn=collate_fn)
 
-
     base_memory_allocated = torch.cuda.max_memory_allocated()
     print(colorize("yellow", "Base GPU memory allocated:") + colorize("green", f"{base_memory_allocated // 1024 ** 2} MB"))
-    
+
     batch = next(iter(loader))
+    
+    while batch['input_ids'].shape[-1] < args.context:
+        batch['input_ids'] = torch.cat([batch['input_ids'], batch['input_ids']], dim=-1)
+        batch['labels'] = torch.cat([batch['labels'], batch['labels']], dim=-1)
+    batch['input_ids'] = batch['input_ids'][..., :args.context]
+    batch['labels'] = batch['labels'][..., :args.context]
+    batch['seq_len'] = args.context
+    batch['attention_mask'] = torch.ones_like(batch['labels'], dtype=torch.int64)
 
-    for context in args.context:
-
-        while batch['input_ids'].shape[-1] < context:
-            batch['input_ids'] = torch.cat([batch['input_ids'], batch['input_ids']], dim=-1)
-            batch['labels'] = torch.cat([batch['labels'], batch['labels']], dim=-1)
-        batch['input_ids'] = batch['input_ids'][..., :context]
-        batch['labels'] = batch['labels'][..., :context]
-        batch['seq_len'] = context
-
+    for chunk_size in args.chunk_size:
         history = History(1_000_000)
+        my_chunkize = partial(chunkize, dim=-1, chunk_size=chunk_size)
 
-        for _ in range(10):
-            
+        for _ in range(3):
+            input_ids = list(my_chunkize(batch['input_ids']))
+            labels = list(my_chunkize(batch['labels']))
+            kv_cache = NestCache(model.num_layers, cpu_offload=1 if args.cpu_offload else None, seq_dim=1)
+            mask_4d = build_4d_float_mask(batch['attention_mask'])
+
             history.init()
             
-            loss = model(
-                input_ids=batch['input_ids'],
-                labels=batch['labels']).sum() / batch['seq_len']
-            loss.backward()
+            with torch.no_grad():
+                for chunk_input, chunk_target in zip(input_ids, labels):
+                    # forward pass
+                    inputs = dict(
+                        input_ids=chunk_input,
+                        labels=chunk_target,
+                        kv_cache=kv_cache)
+                    model(**inputs)
 
-            history.step(loss.item(), batch['seq_len'])
+            # prepare for sparse backward
+            indices, input_ids, labels, budget = prepare_for_sparse_backward(
+                batch['input_ids'], 
+                batch['labels'], 
+                chunk_size, 
+                args.chunk_budget)
+            
+            for chunk_indices, chunk_input, chunk_target in reversed(list(zip(indices, input_ids, labels))):
+
+                mixed_mask = build_mixed_float_mask(mask_4d, chunk_indices)
+
+                inputs = dict(
+                    input_ids=chunk_input,
+                    labels=chunk_target,
+                    kv_cache=kv_cache,
+                    attention_mask=mixed_mask)
+                
+                loss = model(**inputs).sum() / budget
+
+                kv_cache.pre_backward(chunk_indices)
+                loss.backward()
+                kv_cache.after_backward()
+
+            history.step(0, batch['seq_len'])
+            del kv_cache, loss
+            torch.cuda.empty_cache()
 
         mean_time, mean_memory = history.summary(False)
-        template = colorize("yellow", f"{context:<5d}") + "{mean_time:<3.3f} | {mean_memory:.3f}"
+        template = colorize("yellow", f"{chunk_size:<5d}") + "{mean_time:<.2f} | {mean_memory:.2f}"
         print(template.format(mean_time=mean_time, mean_memory=mean_memory))
 
     backend_cleanup()

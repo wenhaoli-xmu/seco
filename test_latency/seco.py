@@ -103,9 +103,9 @@ if __name__ == '__main__':
 
     import json
     if args.context is None:
-        args.context = [512] + [1024 * i for i in range(1,1025)]
+        args.context = [1024 * i for i in range(1,1025)]
     else:
-        args.context = json.loads(args.context)
+        args.context = eval(args.context)
 
 
     # load model
@@ -113,9 +113,7 @@ if __name__ == '__main__':
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
     seed_everything(dist.get_rank())
 
-
     model.train()
-
 
     params = model.ft_params()
     optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(**env_conf['train'], params=params)
@@ -160,10 +158,10 @@ if __name__ == '__main__':
 
         history = History(1_000_000)
 
-        for _ in range(10):
+        for _ in range(3):
             input_ids = list(my_chunkize(batch['input_ids']))
             labels = list(my_chunkize(batch['labels']))
-            kv_cache = SecoCache(model.num_layers)
+            kv_cache = SecoCache(model.num_layers, cpu_offload=1, seq_dim=1)
             loss_accum = 0
 
             history.init()
@@ -181,23 +179,22 @@ if __name__ == '__main__':
 
             for i, (chunk_input, chunk_target) in reversed(list(enumerate(zip(input_ids, labels)))):
 
-                tmp_kv_cache = kv_cache.range(i)
+                kv_cache.pre_reconstruction(i)
 
                 # forward prop
                 inputs = dict(
                     input_ids=chunk_input,
                     labels=chunk_target,
-                    kv_cache=tmp_kv_cache)
+                    kv_cache=kv_cache)
                 loss = model(**inputs).sum() / batch['seq_len']
 
-                # copy kv cache grad
-                tmp_kv_cache.index(i).grad = kv_cache.index(i).grad
-
                 # backward prop
+                kv_cache.pre_backward(i)
                 loss.backward()
+                kv_cache.after_backward()
 
             history.step(loss_accum, batch['seq_len'])
-            del tmp_kv_cache, kv_cache, loss
+            del kv_cache, loss
             torch.cuda.empty_cache()
 
         mean_time, mean_memory = history.summary(False)

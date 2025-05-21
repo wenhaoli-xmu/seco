@@ -93,24 +93,21 @@ def self_attn_forward(self, hidden_states):
 
 
     # query & key & value projection
-    ques = do_projection(self.q_proj, hidden_states, num_heads, head_dim)
-    keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim)
-    vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim)
+    ques = do_projection(self.q_proj, hidden_states, num_heads, head_dim, head_first=False)
+    keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
+    vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
 
     # position embedding
-    pos = torch.arange(0, keys.shape[-2])
+    pos = torch.arange(0, keys.shape[1])
     pos = pos[None, :].to(keys.device)    
     cos, sin = self.rotary_emb(keys, pos)
     cos, sin = cos.squeeze(0), sin.squeeze(0)
     ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
 
-    # attention computation
-    attn_func = float64_attention if hidden_states.dtype == torch.float64 else flash_attn_func
-
-    attn_output = attn_func(
-        q=ques.transpose(-2,-3),
-        k=keys.transpose(-2,-3),
-        v=vals.transpose(-2,-3),
+    attn_output = flash_attn_func(
+        q=ques,
+        k=keys,
+        v=vals,
         causal=True)
 
     attn_output = attn_output.flatten(2)

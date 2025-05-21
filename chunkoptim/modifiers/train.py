@@ -1,20 +1,19 @@
 import torch
 import types
 import torch.distributed
-from transformers.models.llama.modeling_llama import repeat_kv
 from ..modifier import Modifier
 from .utils import check_and_apply_qk_rope, do_projection, generate_mask
 from peft import LoraConfig, get_peft_model, TaskType
-from flash_attn import flash_attn_func
 import torch.nn.functional as F
-from ..utils import SecoCache
+from ..utils import NestCache
+from ..flash_attn.op import flash_attn_func
 
 
 torch.backends.cudnn.deterministic = True
 torch.backends.cudnn.benchmark = False
 
 
-def model_forward(self, input_ids, kv_cache, **kwargs):
+def model_forward(self, input_ids, kv_cache, attention_mask=None, **kwargs):
     """
     Input
     -----
@@ -22,30 +21,28 @@ def model_forward(self, input_ids, kv_cache, **kwargs):
     :kv_cache: key value cache
     :kwargs: To absorb useless arguments passed by lib peft
     """
-    hidden_states = self.model(input_ids, kv_cache)
+    hidden_states = self.model(input_ids, kv_cache, attention_mask)
     logits = self.lm_head(hidden_states)
     return logits
 
 
-
-def model_model_forward(self, input_ids, kv_cache):
+def model_model_forward(self, input_ids, kv_cache, attention_mask):
 
     inputs_embeds = self.embed_tokens(input_ids)
     hidden_states = inputs_embeds
 
     for layer in self.layers:
-        hidden_states = layer(hidden_states, kv_cache)
+        hidden_states = layer(hidden_states, kv_cache, attention_mask)
         
     hidden_states = self.norm(hidden_states)
 
     return hidden_states
 
 
-
-def layer_forward(self, hidden_states, kv_cache):
+def layer_forward(self, hidden_states, kv_cache, attention_mask):
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
-    hidden_states = self.self_attn(hidden_states, kv_cache)
+    hidden_states = self.self_attn(hidden_states, kv_cache, attention_mask)
     hidden_states = residual.to(hidden_states.device) + hidden_states
 
     residual = hidden_states
@@ -85,36 +82,54 @@ def float64_attention(q, k, v, causal=False):
     return attn_output
 
 
-def self_attn_forward(self, hidden_states, kv_cache):
+def repeat_kv(hidden_states, n_rep):
+    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
+    if n_rep == 1:
+        return hidden_states
+    hidden_states = hidden_states[:, :, None, :, :].expand(batch, slen, n_rep, num_key_value_heads, head_dim)
+    return hidden_states.reshape(batch, slen, n_rep * num_key_value_heads, head_dim)
+
+
+def self_attn_forward(self, hidden_states, kv_cache, attention_mask):
 
     num_heads, embed_dim = self.config.num_attention_heads, self.config.hidden_size
     num_kv_heads = self.config.num_key_value_heads
     head_dim = embed_dim // num_heads
 
     # query & key & value projection
-    ques = do_projection(self.q_proj, hidden_states, num_heads, head_dim)
-    keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim)
-    vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim)
+    ques = do_projection(self.q_proj, hidden_states, num_heads, head_dim, head_first=False)
+    keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
+    vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
 
     # position embedding
     past_length = kv_cache.length(self.layer_idx)
-    pos = torch.arange(0, past_length + keys.shape[-2])
+    pos = torch.arange(0, past_length + keys.shape[1])
     pos = pos[None, :].to(keys.device)    
     cos, sin = self.rotary_emb(keys, pos)
     cos, sin = cos.squeeze(0), sin.squeeze(0)
     ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin, pos=kv_cache.length(self.layer_idx))
 
-    # update kv cache
     keys, vals = kv_cache.update(self.layer_idx, keys, vals)
 
-    # attention computation
-    attn_func = float64_attention if hidden_states.dtype == torch.float64 else flash_attn_func
+    # sparse configuration
+    # sparse_cfg = dict(
+    #     sparse_backward=False,
+    #     ratio_lowerbound=0.1,
+    #     budget_lowerbound=1024,
+    # ) if self.layer_idx >= 2 else dict(
+    #     sparse_backward=False,
+    #     ratio_lowerbound=None,
+    #     budget_lowerbound=None)
 
-    attn_output = attn_func(
-        q=ques.transpose(-2,-3),
-        k=keys.transpose(-2,-3),
-        v=vals.transpose(-2,-3),
-        causal=True)
+    # flash attention
+    attn_output = flash_attn_func(
+        ques,
+        keys,
+        vals,
+        kv_cache,
+        self.layer_idx,
+        attention_mask)
+        # *tuple(sparse_cfg.values()))
 
     attn_output = attn_output.flatten(2)
     attn_output = self.o_proj(attn_output)
@@ -172,14 +187,15 @@ class ModelForTraining(Modifier):
                     layer.self_attn.v_proj.lora_B.default.weight]
             else:
                 params += layer.parameters()
-
         return params
-    
 
-    def forward(self, input_ids, labels, kv_cache):
 
-        # compute logits
-        logits = self.model(input_ids=input_ids, kv_cache=kv_cache).to(input_ids.device)
+    def forward(self, input_ids, labels, kv_cache, attention_mask=None):
+
+        logits = self.model(
+            input_ids=input_ids, 
+            kv_cache=kv_cache, 
+            attention_mask=attention_mask).to(input_ids.device)
 
         if labels is not None:
             logits = logits.to(labels.device)
@@ -188,7 +204,7 @@ class ModelForTraining(Modifier):
             return torch.nn.functional.cross_entropy(logits, labels, reduce=False)
         else:
             return logits[:, -1:, :]
-    
+
 
     @torch.no_grad()
     def generate(self, input_ids, tokenizer, max_new_tokens=128, eos_token_id=[2]):
@@ -199,7 +215,7 @@ class ModelForTraining(Modifier):
         if input_ids.ndim == 1:
             input_ids = input_ids.unsqueeze(0)
 
-        kv_cache = SecoCache(len(self.model.model.model.layers))
+        kv_cache = NestCache(len(self.model.model.model.layers))
 
         logits = self.forward(input_ids=input_ids, labels=None, kv_cache=kv_cache)
         new_tok = logits.argmax(dim=-1)
