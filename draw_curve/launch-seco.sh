@@ -9,7 +9,7 @@ torchrun \
     draw_curve/seco.py \
     --env-conf draw_curve/llama3-8b.json \
     --accum-grad 4 \
-    --chunk-size 2048 \
+    --chunk-size 1024 \
     --log-step 1 \
-    --seed 3 \
+    --seed 0 \
     --lr 2e-5

@@ -10,7 +10,6 @@ from chunkoptim.utils import (
     get_env_conf, 
     get_torch_dtype,
     get_optimizer_and_lr_adjuster, 
-    SecoCache,
     chunkize,
     History)
 
@@ -139,14 +138,15 @@ if __name__ == '__main__':
 
         history.init()
 
-        loss = model(
+        outputs = model(
             input_ids=batch['input_ids'],
             labels=batch['labels'])
-        loss = loss.sum() / batch['seq_len']
+
+        loss = outputs.sum() / batch['seq_len']
 
         loss.backward()
         history.step(loss.item(), batch['seq_len'])
-        
+
         if (step + 1) % args.accum_grad:
             optimizer.step()
             zero_grad(params)

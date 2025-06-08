@@ -12,6 +12,8 @@ LongBench
 *.egg-info
 *.pyc
 *.pth
+*.jpg
+*.log
 results
 grads
 .vscode/

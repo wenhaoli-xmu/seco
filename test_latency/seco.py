@@ -10,9 +10,10 @@ from chunkoptim.utils import (
     get_env_conf, 
     get_torch_dtype,
     get_optimizer_and_lr_adjuster, 
-    SecoCache,
     chunkize,
     History)
+
+from chunkoptim.kv_cache import KVCache
 
 import argparse, random, numpy, os
 from functools import partial
@@ -161,7 +162,15 @@ if __name__ == '__main__':
         for _ in range(3):
             input_ids = list(my_chunkize(batch['input_ids']))
             labels = list(my_chunkize(batch['labels']))
-            kv_cache = SecoCache(model.num_layers, cpu_offload=1, seq_dim=1)
+
+            kv_cache = KVCache(
+                num_layers=model.model.config.num_hidden_layers,
+                batch_size=1,
+                page_size=64,
+                num_heads=model.model.config.num_key_value_heads,
+                chunk_size=args.chunk_size,
+                cpu_offload=2)
+
             loss_accum = 0
 
             history.init()
@@ -177,9 +186,7 @@ if __name__ == '__main__':
                     model(**inputs)
 
 
-            for i, (chunk_input, chunk_target) in reversed(list(enumerate(zip(input_ids, labels)))):
-
-                kv_cache.pre_reconstruction(i)
+            for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
 
                 # forward prop
                 inputs = dict(
@@ -189,16 +196,17 @@ if __name__ == '__main__':
                 loss = model(**inputs).sum() / batch['seq_len']
 
                 # backward prop
-                kv_cache.pre_backward(i)
+                kv_cache.pre_process()
                 loss.backward()
-                kv_cache.after_backward()
+                kv_cache.post_process()
 
             history.step(loss_accum, batch['seq_len'])
-            del kv_cache, loss
+            del kv_cache
             torch.cuda.empty_cache()
 
         mean_time, mean_memory = history.summary(False)
-        template = colorize("yellow", f"{context:<5d}") + "{mean_time:<3.3f} | {mean_memory:.3f}"
-        print(template.format(mean_time=mean_time, mean_memory=mean_memory))
+        current_memory_alloc = torch.cuda.memory_allocated()
+        template = colorize("yellow", f"{context:<5d}") + "{mean_time:<3.3f} | {mean_memory:.3f} | {current_memory_alloc:.3f}"
+        print(template.format(mean_time=mean_time, mean_memory=mean_memory, current_memory_alloc=current_memory_alloc))
 
     backend_cleanup()

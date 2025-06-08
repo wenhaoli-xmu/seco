@@ -11,8 +11,9 @@ from chunkoptim.utils import (
     get_torch_dtype,
     get_optimizer_and_lr_adjuster, 
     chunkize,
-    ListCache,
     History)
+
+from chunkoptim.kv_cache import KVCache
 
 import argparse, random, numpy, os, json
 from pygments.console import colorize
@@ -143,7 +144,13 @@ if __name__ == '__main__':
 
         input_ids = list(chunkize(batch['input_ids'], -1, args.chunk_size))
         labels = list(chunkize(batch['labels'], -1, args.chunk_size))
-        kv_cache = ListCache(model.num_layers, cpu_offload=1, seq_dim=1)
+        kv_cache = KVCache(
+            num_layers=model.model.config.num_hidden_layers,
+            batch_size=1,
+            page_size=64,
+            num_heads=model.model.config.num_key_value_heads,
+            chunk_size=args.chunk_size,
+            cpu_offload=2)
 
         history.init()
         
@@ -159,9 +166,7 @@ if __name__ == '__main__':
 
         accum_loss = 0
 
-        for i, (chunk_input, chunk_target) in reversed(list(enumerate(zip(input_ids, labels)))):
-
-            kv_cache.pre_recon(i)
+        for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
 
             # forward prop
             inputs = dict(
@@ -169,12 +174,14 @@ if __name__ == '__main__':
                 labels=chunk_target,
                 kv_cache=kv_cache)
 
-            loss = model(**inputs).sum() / batch['seq_len']
+            outputs = model(**inputs)
+
+            loss = outputs.sum() / batch['seq_len']
             accum_loss += loss.item()
 
-            # kv_cache.pre_backward(i)
+            kv_cache.pre_process()
             loss.backward()
-            kv_cache.after_backward()
+            kv_cache.post_process()
 
         history.step(accum_loss, batch['seq_len'])
 

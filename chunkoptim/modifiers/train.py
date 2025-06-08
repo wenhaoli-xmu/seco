@@ -5,8 +5,8 @@ from ..modifier import Modifier
 from .utils import check_and_apply_qk_rope, do_projection, generate_mask
 from peft import LoraConfig, get_peft_model, TaskType
 import torch.nn.functional as F
-from ..utils import NestCache
-from ..flash_attn.op import flash_attn_func
+from ..flash_paged_attn import flash_paged_attn_func
+from torch.utils.checkpoint import checkpoint
 
 
 torch.backends.cudnn.deterministic = True
@@ -32,7 +32,10 @@ def model_model_forward(self, input_ids, kv_cache, attention_mask):
     hidden_states = inputs_embeds
 
     for layer in self.layers:
-        hidden_states = layer(hidden_states, kv_cache, attention_mask)
+        hidden_states = layer(
+            hidden_states, 
+            kv_cache, 
+            attention_mask)
         
     hidden_states = self.norm(hidden_states)
 
@@ -82,14 +85,6 @@ def float64_attention(q, k, v, causal=False):
     return attn_output
 
 
-def repeat_kv(hidden_states, n_rep):
-    batch, slen, num_key_value_heads, head_dim = hidden_states.shape
-    if n_rep == 1:
-        return hidden_states
-    hidden_states = hidden_states[:, :, None, :, :].expand(batch, slen, n_rep, num_key_value_heads, head_dim)
-    return hidden_states.reshape(batch, slen, n_rep * num_key_value_heads, head_dim)
-
-
 def self_attn_forward(self, hidden_states, kv_cache, attention_mask):
 
     num_heads, embed_dim = self.config.num_attention_heads, self.config.hidden_size
@@ -101,35 +96,30 @@ def self_attn_forward(self, hidden_states, kv_cache, attention_mask):
     keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
     vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
 
-    # position embedding
+    # past length
     past_length = kv_cache.length(self.layer_idx)
-    pos = torch.arange(0, past_length + keys.shape[1])
-    pos = pos[None, :].to(keys.device)    
+    if torch.is_grad_enabled():
+        # NOTE: stage-2: second forward prop
+        past_length -= ques.shape[1]
+
+    # position embedding
+    pos = torch.arange(past_length, past_length + keys.shape[1])
+    pos = pos[None, :].to(keys.device)
     cos, sin = self.rotary_emb(keys, pos)
-    cos, sin = cos.squeeze(0), sin.squeeze(0)
-    ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin, pos=kv_cache.length(self.layer_idx))
+    ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
 
-    keys, vals = kv_cache.update(self.layer_idx, keys, vals)
+    # GQA
+    manager = kv_cache[self.layer_idx]
 
-    # sparse configuration
-    # sparse_cfg = dict(
-    #     sparse_backward=False,
-    #     ratio_lowerbound=0.1,
-    #     budget_lowerbound=1024,
-    # ) if self.layer_idx >= 2 else dict(
-    #     sparse_backward=False,
-    #     ratio_lowerbound=None,
-    #     budget_lowerbound=None)
+    if not torch.is_grad_enabled():
+        # NOTE: stage-1: first forward prop
+        manager.update(keys, vals)
 
-    # flash attention
-    attn_output = flash_attn_func(
+    attn_output = flash_paged_attn_func(
         ques,
         keys,
         vals,
-        kv_cache,
-        self.layer_idx,
-        attention_mask)
-        # *tuple(sparse_cfg.values()))
+        manager)
 
     attn_output = attn_output.flatten(2)
     attn_output = self.o_proj(attn_output)

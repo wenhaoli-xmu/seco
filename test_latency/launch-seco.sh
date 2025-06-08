@@ -12,4 +12,4 @@ torchrun \
     --accum-grad 8 \
     --chunk-size 512 \
     --log-step 1 \
-    --context "[10240 * i for i in range(1,10)]"
+    --context "[10240 * i for i in range(1,100)]"

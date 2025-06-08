@@ -30,10 +30,11 @@ def model_model_forward(self, input_ids):
     hidden_states = inputs_embeds
 
     for layer in self.layers:
-        hidden_states = checkpoint(
-            layer,
-            hidden_states,
-            use_reentrant=False)
+        # hidden_states = checkpoint(
+        #     layer,
+        #     hidden_states,
+        #     use_reentrant=False)
+        hidden_states = layer(hidden_states)
         
     hidden_states = self.norm(hidden_states)
 
@@ -101,7 +102,6 @@ def self_attn_forward(self, hidden_states):
     pos = torch.arange(0, keys.shape[1])
     pos = pos[None, :].to(keys.device)    
     cos, sin = self.rotary_emb(keys, pos)
-    cos, sin = cos.squeeze(0), sin.squeeze(0)
     ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
 
     attn_output = flash_attn_func(

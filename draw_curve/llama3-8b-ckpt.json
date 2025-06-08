@@ -1,6 +1,6 @@
 {
     "model": {
-        "model_name": "unsloth/llama-3-8b",
+        "model_name": "/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/Meta-Llama-3-8B/",
         "model_dtype": "bf16",
         "model_method": "train-ckpt",
         "model_structure": null,
@@ -20,7 +20,7 @@
         "corpus": [
             {
                 "data": "data/pg19/train.json",
-                "conf": "config/slimpajama-trunc16384.json",
+                "conf": "config/slimpajama-trunc32768.json",
                 "partition": 1.0
             }
         ]

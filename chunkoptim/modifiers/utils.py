@@ -29,9 +29,15 @@ def do_projection(proj, states, num_heads, head_dim, head_first=True):
     states =  proj(states).unflatten(-1, (num_heads, head_dim))
     return states.transpose(1,2) if head_first else states
 
-def apply_rotary_pos_emb(mat, cos, sin, position_ids, unsqueeze_dim=1):
-    cos = cos[position_ids].unsqueeze(unsqueeze_dim)
-    sin = sin[position_ids].unsqueeze(unsqueeze_dim)
+def apply_rotary_pos_emb(mat, cos, sin, position_ids=None, unsqueeze_dim=1):
+    
+    if position_ids is not None:
+        cos = cos[position_ids]
+        sin = sin[position_ids]
+
+    cos = cos.unsqueeze(unsqueeze_dim)
+    sin = sin.unsqueeze(unsqueeze_dim)
+
     mat_embed = (mat * cos) + (rotate_half(mat) * sin)
 
     return mat_embed
@@ -43,14 +49,7 @@ def new_posid(num_token: int, device, dtype, bsz):
     return appendix
 
 
-def check_and_apply_qk_rope(query, key, cos, sin, pos=0):
-    batch_size, num_query, num_heads, head_dim = query.shape
-    num_kv = key.shape[1]
-
-    new_posid_spec = partial(new_posid, device=query.device, dtype=query.dtype, bsz=batch_size)
-    pos_list = new_posid_spec(pos + num_kv)
-
-    Q = apply_rotary_pos_emb(query, cos, sin, pos_list[:,-num_query:], unsqueeze_dim=2)
-    K = apply_rotary_pos_emb(key, cos, sin, pos_list[:,-num_kv:], unsqueeze_dim=2)
-
+def check_and_apply_qk_rope(query, key, cos, sin):    
+    Q = apply_rotary_pos_emb(query, cos, sin, unsqueeze_dim=2)
+    K = apply_rotary_pos_emb(key, cos, sin, unsqueeze_dim=2)
     return Q, K
