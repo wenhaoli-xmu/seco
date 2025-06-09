@@ -50,7 +50,17 @@ Compared to mainstream training approaches, SeCO and SpaCO demonstrate substanti
 $ git clone https://github.com/wenhaoli-xmu/seco.git
 $ cd seco
 $ pip install -e .
-$ pip install -r requirements.txt
+$ pip install -r requirement.txt
+
+# for training
+$ git clone https://github.com/wenhaoli-xmu/lm-corpus.git
+$ cd lm-corpus
+$ pip install -e .
+
+# for profiling
+$ git clone https://github.com/wenhaoli-xmu/lm-profiler.git
+$ cd lm-profiler
+$ pip install -e .
 ```
 
 ### Example-1: Single GPU
