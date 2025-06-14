@@ -92,6 +92,7 @@ if __name__ == '__main__':
     parser.add_argument("--log-step", type=int, default=100)
     parser.add_argument("--accum-grad", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--offload", action='store_true')
     parser.add_argument("--lr", type=float, default=1e-4)
 
     args = parser.parse_args()
@@ -149,8 +150,7 @@ if __name__ == '__main__':
             batch_size=1,
             page_size=64,
             num_heads=model.model.config.num_key_value_heads,
-            chunk_size=args.chunk_size,
-            cpu_offload=2)
+            cpu_offload=2 if args.offload else None)
 
         history.init()
         

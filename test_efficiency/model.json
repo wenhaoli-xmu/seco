@@ -1,12 +1,12 @@
 {
     "model": {
-        "model_name": "unsloth/llama-3-8b",
+        "model_name": "/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/Meta-Llama-3-8B/",
         "model_dtype": "bf16",
-        "model_method": "train",
+        "model_method": null,
         "model_structure": null,
-        "save_ckp": "ckp/model.pth",
+        "save_ckp": null,
         "load_ckp": null,
-        "config": "config/train.json",
+        "config": "config/full.json",
         "device_map": null
     },
 
@@ -20,7 +20,7 @@
         "corpus": [
             {
                 "data": "data/slimpajama/arxiv.json",
-                "conf": "config/slimpajama-trunc32768.json",
+                "conf": "config/slimpajama-trunc65536.json",
                 "partition": 1.0
             }
         ]

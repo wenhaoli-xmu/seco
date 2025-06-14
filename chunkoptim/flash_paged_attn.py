@@ -162,17 +162,17 @@ def _fwd_kernel(
         lse_i = m_ij + tl.log(l_i_new)
 
     o_scale = tl.exp(m_i - lse_i)
-    # BUG: have to store and immediately load
+
     tl.store(t_ptrs, o_scale)
     o_scale = tl.load(t_ptrs)
     acc_o = acc_o * o_scale[:, None]
-    # rematerialize offsets to save registers
+
     start_m = tl.program_id(0)
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    # write back l and m
+
     lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
     tl.store(lse_ptrs, lse_i)
-    # initialize pointers to output
+
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     out_ptrs = (
         Out
@@ -614,8 +614,8 @@ def _flash_attn_forward(
         BLOCK_N=BLOCK,
         GROUP_SIZE=GROUP_SIZE,
         num_warps=num_warps,
-        num_stages=1,
-    )
+        num_stages=1)
+
     return o, lse, softmax_scale  # softmax_scale could have been updated
 
 

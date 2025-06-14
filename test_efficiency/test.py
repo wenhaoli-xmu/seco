@@ -2,20 +2,21 @@ from torch.utils.data import ConcatDataset, DataLoader
 import torch.distributed as dist
 
 import torch
+import json
 
 
 from corpus import get_processor, LazyRandomSampleCorpus
 from chunkoptim.utils import (
     get_model_and_tokenizer, 
     get_env_conf, 
-    get_torch_dtype,
-    get_optimizer_and_lr_adjuster, 
-    SecoCache,
     chunkize,
     History)
+from functools import partial
+from pathlib import Path
+
+from chunkoptim.kv_cache import KVCache
 
 import argparse, random, numpy, os
-from functools import partial
 from pygments.console import colorize
 
 
@@ -76,53 +77,21 @@ def backend_cleanup():
     dist.destroy_process_group()
 
 
-if __name__ == '__main__':
 
-
+def launch_test(args, pipeline):
     backend_setup()
-
-
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--env-conf", type=str, required=True)
     
-    # algorithm related arguments
-    parser.add_argument("--chunk-budget", type=int, default=8)
-    parser.add_argument("--chunk-size", type=int, default=None)
-    parser.add_argument("--context", type=str, default=None)
-
-    # others
-    parser.add_argument("--log-step", type=int, default=100)
-    parser.add_argument("--accum-grad", type=int, default=1)
-
-    args = parser.parse_args()
-
-    
-    env_conf = get_env_conf(args.env_conf)
+    env_conf = args.env_conf
     env_conf['model']['device_map'] = {"": dist.get_rank()}
-    dtype = get_torch_dtype(env_conf['model']['model_dtype'])
-
-
-    import json
-    if args.context is None:
-        args.context = [512] + [1024 * i for i in range(1,1025)]
-    else:
-        args.context = json.loads(args.context)
+    args.context = eval(args.context)
 
 
     # load model
     seed_everything(0)
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
     seed_everything(dist.get_rank())
-
-
     model.train()
 
-
-    params = model.ft_params()
-    optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(**env_conf['train'], params=params)
-
-
-    # build dataset
     """
     NOTE: Rank0 dataset loading is ahead of other ranks. This is because data buffer is saved after rank0 finishes,
     thus others can utilize this buffer to avoid redundant processing and ensure consistency across ranks.
@@ -134,22 +103,15 @@ if __name__ == '__main__':
         corpus = build_dataset(env_conf, tokenizer)
     dist.barrier()
 
-
     loader = DataLoader(
         corpus, 
         batch_size=1, 
         collate_fn=collate_fn)
 
-    my_chunkize = partial(chunkize, dim=-1, chunk_size=args.chunk_size)
-
-
     base_memory_allocated = torch.cuda.max_memory_allocated()
     print(colorize("yellow", "Base GPU memory allocated:") + colorize("green", f"{base_memory_allocated // 1024 ** 2} MB"))
-
-
+    
     batch = next(iter(loader))
-    
-    
 
     for context in args.context:
 
@@ -163,55 +125,98 @@ if __name__ == '__main__':
         history = History(1_000_000)
 
         for _ in range(10):
-            input_ids = list(my_chunkize(batch['input_ids']))
-            labels = list(my_chunkize(batch['labels']))
-            kv_cache = SecoCache(model.num_layers)
-            loss_accum = 0
-
+            
             history.init()
-            
-            with torch.no_grad():
-                for chunk_input, chunk_target in zip(input_ids, labels):
 
-                    # forward pass
-                    inputs = dict(
-                        input_ids=chunk_input,
-                        labels=chunk_target,
-                        kv_cache=kv_cache)
-                    model(**inputs)
+            pipeline(
+                model=model,
+                batch=batch)
 
-            
-            I = torch.randperm(len(input_ids))[:args.chunk_budget]
-
-
-            for i, (chunk_input, chunk_target) in reversed(list(enumerate(zip(input_ids, labels)))):
-
-
-                if i in I:
-
-                    tmp_kv_cache = kv_cache.range(i)
-
-                    # forward prop
-                    inputs = dict(
-                        input_ids=chunk_input,
-                        labels=chunk_target,
-                        kv_cache=tmp_kv_cache)
-                    loss = model(**inputs).sum() / batch['seq_len']
-
-                    # copy kv cache grad
-                    tmp_kv_cache.index(i).copy_scaled_grad(
-                        gd=kv_cache.index(i).grad, 
-                        scaler=len(input_ids) / args.chunk_budget)
-
-                    # backward prop
-                    loss.backward()
-
-            history.step(loss_accum, batch['seq_len'])
-            del tmp_kv_cache, kv_cache, loss
-            torch.cuda.empty_cache()
+            history.step(0, batch['seq_len'])
 
         mean_time, mean_memory = history.summary(False)
-        template = colorize("yellow", f"{context:<5d}") + "{mean_time:<3.3f} | {mean_memory:.3f}"
+        template = colorize("yellow", f"{context:<5d}\t|") + "{mean_time:<3.3f}\t| {mean_memory:.3f}"
         print(template.format(mean_time=mean_time, mean_memory=mean_memory))
 
     backend_cleanup()
+
+
+def baseline(model, batch, grad_ckpt, page_size):
+    kv_cache = KVCache(
+        num_layers=model.model.config.num_hidden_layers,
+        batch_size=1,
+        page_size=page_size,
+        num_heads=model.model.config.num_key_value_heads,
+        cpu_offload=None)
+
+    loss = model(
+        input_ids=batch['input_ids'],
+        labels=batch['labels'],
+        kv_cache=kv_cache,
+        grad_ckpt=grad_ckpt).sum() / batch['seq_len']
+    loss.backward()
+
+
+def blockwise(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
+    my_chunkize = partial(chunkize, dim=-1, chunk_size=block_size)
+    input_ids = list(my_chunkize(batch['input_ids']))
+    labels = list(my_chunkize(batch['labels']))
+
+    kv_cache = KVCache(
+        num_layers=model.model.config.num_hidden_layers,
+        batch_size=1,
+        page_size=page_size,
+        num_heads=model.model.config.num_key_value_heads,
+        cpu_offload=cpu_offload)
+
+    with torch.no_grad():
+        for chunk_input, chunk_target in zip(input_ids, labels):
+
+            # forward pass
+            inputs = dict(
+                input_ids=chunk_input,
+                labels=chunk_target,
+                kv_cache=kv_cache,
+                grad_ckpt=False)
+            model(**inputs)
+
+    for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
+
+        # forward prop
+        inputs = dict(
+            input_ids=chunk_input,
+            labels=chunk_target,
+            kv_cache=kv_cache,
+            grad_ckpt=grad_ckpt)
+        loss = model(**inputs).sum() / batch['seq_len']
+
+        # backward prop
+        kv_cache.pre_process()
+        loss.backward()
+        kv_cache.post_process()
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--context", type=str, default="[10240 * (i + 1) for i in range(10)]")
+    parser.add_argument("--config", type=str, required=True)
+    args = parser.parse_args()
+
+    args.config = json.load(open(args.config, 'r'))
+    args.env_conf = Path(os.path.dirname(__file__)) / 'model.json'
+    args.env_conf = get_env_conf(args.env_conf)
+
+    method = args.config.pop('method')
+    args.env_conf['model']['model_method'] = method
+    kwargs = args.config
+
+
+    if method == 'baseline':
+        pipe = baseline
+
+    elif method == 'blockwise':
+        pipe = blockwise
+
+
+    pipe = partial(pipe, **kwargs)
+    launch_test(args, pipe)

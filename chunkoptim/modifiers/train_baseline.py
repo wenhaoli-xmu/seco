@@ -4,16 +4,15 @@ import torch.distributed
 from ..modifier import Modifier
 from .utils import check_and_apply_qk_rope, do_projection, generate_mask
 from peft import LoraConfig, get_peft_model, TaskType
-import torch.nn.functional as F
-from ..flash_paged_attn import flash_paged_attn_func
+from flash_attn import flash_attn_func
+
 from torch.utils.checkpoint import checkpoint
+import torch.nn.functional as F
+from ..kv_cache import CacheManager, KVCache
+from ..flash_paged_attn import flash_paged_attn_func
 
 
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
-
-def model_forward(self, input_ids, kv_cache, attention_mask=None, **kwargs):
+def model_forward(self, input_ids, kv_cache, grad_ckpt, **kwargs):
     """
     Input
     -----
@@ -21,33 +20,42 @@ def model_forward(self, input_ids, kv_cache, attention_mask=None, **kwargs):
     :kv_cache: key value cache
     :kwargs: To absorb useless arguments passed by lib peft
     """
-    hidden_states = self.model(input_ids, kv_cache, attention_mask)
+    hidden_states = self.model(input_ids, kv_cache, grad_ckpt)
     logits = self.lm_head(hidden_states)
     return logits
 
 
-def model_model_forward(self, input_ids, kv_cache, attention_mask):
+
+def model_model_forward(self, input_ids, kv_cache, grad_ckpt):
 
     inputs_embeds = self.embed_tokens(input_ids)
     hidden_states = inputs_embeds
 
     for layer in self.layers:
-        hidden_states = layer(
-            hidden_states, 
-            kv_cache, 
-            attention_mask)
+        if grad_ckpt:
+            hidden_states = checkpoint(
+                layer,
+                hidden_states,
+                kv_cache,
+                use_reentrant=False)
+        else:
+            hidden_states = layer(
+                hidden_states, 
+                kv_cache)
         
     hidden_states = self.norm(hidden_states)
 
     return hidden_states
 
 
-def layer_forward(self, hidden_states, kv_cache, attention_mask):
+
+def layer_forward(self, hidden_states, kv_cache):
+
     residual = hidden_states
     hidden_states = self.input_layernorm(hidden_states)
-    hidden_states = self.self_attn(hidden_states, kv_cache, attention_mask)
+    hidden_states = self.self_attn(hidden_states, kv_cache)
     hidden_states = residual.to(hidden_states.device) + hidden_states
-
+    
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
     hidden_states = self.mlp(hidden_states)
@@ -85,41 +93,28 @@ def float64_attention(q, k, v, causal=False):
     return attn_output
 
 
-def self_attn_forward(self, hidden_states, kv_cache, attention_mask):
+def self_attn_forward(self, hidden_states, kv_cache):
 
     num_heads, embed_dim = self.config.num_attention_heads, self.config.hidden_size
     num_kv_heads = self.config.num_key_value_heads
     head_dim = embed_dim // num_heads
+
 
     # query & key & value projection
     ques = do_projection(self.q_proj, hidden_states, num_heads, head_dim, head_first=False)
     keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
     vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
 
-    # past length
-    past_length = kv_cache.length(self.layer_idx)
-    if torch.is_grad_enabled():
-        # NOTE: stage-2: second forward prop
-        past_length -= ques.shape[1]
-
     # position embedding
-    pos = torch.arange(past_length, past_length + keys.shape[1])
+    pos = torch.arange(0, keys.shape[1])
     pos = pos[None, :].to(keys.device)
     cos, sin = self.rotary_emb(keys, pos)
     ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
 
-    # GQA
     manager = kv_cache[self.layer_idx]
+    manager.update(keys, vals)
 
-    if not torch.is_grad_enabled():
-        # NOTE: stage-1: first forward prop
-        manager.update(keys, vals)
-
-    attn_output = flash_paged_attn_func(
-        ques,
-        keys,
-        vals,
-        manager)
+    attn_output = flash_paged_attn_func(ques, keys, vals, manager)
 
     attn_output = attn_output.flatten(2)
     attn_output = self.o_proj(attn_output)
@@ -147,7 +142,6 @@ class ModelForTraining(Modifier):
 
         super().__init__(model, save_ckp, load_ckp)
 
-
     def _init_lora(self, model, lora_rank, lora_alpha, lora_dropout):
         target_modules = r".*\.(self_attn|mlp)\.(q|v)_proj"
         peft_config = LoraConfig(
@@ -158,13 +152,11 @@ class ModelForTraining(Modifier):
             target_modules=target_modules)
         return get_peft_model(model, peft_config)
 
-
     def _get_model(self):
         if self.conf['lora']['enable']:
             return self.model.model
         else:
             return self.model
-
 
     def ft_params(self):
         params = []
@@ -179,46 +171,12 @@ class ModelForTraining(Modifier):
                 params += layer.parameters()
         return params
 
+    def forward(self, input_ids, labels, kv_cache, grad_ckpt=False):
 
-    def forward(self, input_ids, labels, kv_cache, attention_mask=None):
-
-        logits = self.model(
-            input_ids=input_ids, 
-            kv_cache=kv_cache, 
-            attention_mask=attention_mask).to(input_ids.device)
-
-        if labels is not None:
-            logits = logits.to(labels.device)
-            logits = logits.squeeze(0)
-            labels = labels.squeeze(0)
-            return torch.nn.functional.cross_entropy(logits, labels, reduce=False)
-        else:
-            return logits[:, -1:, :]
-
-
-    @torch.no_grad()
-    def generate(self, input_ids, tokenizer, max_new_tokens=128, eos_token_id=[2]):
-
-        device = next(iter(self.model.parameters())).device
-        input_ids = input_ids.to(device)
-
-        if input_ids.ndim == 1:
-            input_ids = input_ids.unsqueeze(0)
-
-        kv_cache = NestCache(len(self.model.model.model.layers))
-
-        logits = self.forward(input_ids=input_ids, labels=None, kv_cache=kv_cache)
-        new_tok = logits.argmax(dim=-1)
-        new_ids = [new_tok]
-
-        while len(new_ids) < max_new_tokens:
-
-            logits = self.forward(input_ids=new_tok, labels=None, kv_cache=kv_cache)
-            new_tok = logits.argmax(dim=-1)
-
-            if new_tok.ravel().item() in eos_token_id: break
-            new_ids.append(new_tok.ravel().item())
-
-        del kv_cache
-        new_ids = torch.tensor(new_ids, dtype=input_ids.dtype, device=input_ids.device)[None, :]
-        return torch.cat([input_ids, new_ids], dim=-1)
+        # compute logits
+        logits = self.model(input_ids=input_ids, kv_cache=kv_cache, grad_ckpt=grad_ckpt).to(labels.device)
+        
+        # compute loss
+        logits = logits.squeeze(0)
+        labels = labels.squeeze(0)
+        return torch.nn.functional.cross_entropy(logits, labels, reduce=False)

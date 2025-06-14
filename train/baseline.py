@@ -10,14 +10,12 @@ from chunkoptim.utils import (
     get_env_conf, 
     get_torch_dtype,
     get_optimizer_and_lr_adjuster, 
-    chunkize,
     History)
 
-from chunkoptim.kv_cache import KVCache
-
-import argparse, random, numpy, os
-from functools import partial
+import argparse, random, numpy, os, json
 from pygments.console import colorize
+
+from chunkoptim.kv_cache import KVCache, CacheManager
 
 
 def zero_grad(params):
@@ -85,36 +83,28 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-conf", type=str, required=True)
-    
-    # algorithm related arguments
-    parser.add_argument("--chunk-size", type=int, default=None)
-    parser.add_argument("--context", type=str, default=None)
 
     # others
     parser.add_argument("--log-step", type=int, default=100)
     parser.add_argument("--accum-grad", type=int, default=1)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--lr", type=float, default=1e-4)
 
     args = parser.parse_args()
 
     
     env_conf = get_env_conf(args.env_conf)
-    env_conf['model']['device_map'] = {"": dist.get_rank()}
+    env_conf['train']['max_lr'] = args.lr
     dtype = get_torch_dtype(env_conf['model']['model_dtype'])
-
-
-    import json
-    if args.context is None:
-        args.context = [1024 * i for i in range(1,1025)]
-    else:
-        args.context = eval(args.context)
 
 
     # load model
     seed_everything(0)
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
-    seed_everything(dist.get_rank())
+    seed_everything(args.seed)
 
-    model.train()
+    model.eval()
+
 
     params = model.ft_params()
     optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(**env_conf['train'], params=params)
@@ -138,75 +128,38 @@ if __name__ == '__main__':
         batch_size=1, 
         collate_fn=collate_fn)
 
-    my_chunkize = partial(chunkize, dim=-1, chunk_size=args.chunk_size)
-
 
     base_memory_allocated = torch.cuda.max_memory_allocated()
     print(colorize("yellow", "Base GPU memory allocated:") + colorize("green", f"{base_memory_allocated // 1024 ** 2} MB"))
+    history = History(args.log_step)
+    kv_cache = KVCache(
+        num_layers=model.model.config.num_hidden_layers,
+        batch_size=1,
+        page_size=64,
+        num_heads=model.model.config.num_key_value_heads,
+        cpu_offload=None)
 
+    for step, batch in enumerate(loader):
+        lr_adjuster(step=step)
 
-    batch = next(iter(loader))
-    
+        history.init()
 
-    for context in args.context:
+        kv_cache.reset()
+        outputs = model(
+            input_ids=batch['input_ids'],
+            labels=batch['labels'],
+            kv_cache=kv_cache)
 
-        while batch['input_ids'].shape[-1] < context:
-            batch['input_ids'] = torch.cat([batch['input_ids'], batch['input_ids']], dim=-1)
-            batch['labels'] = torch.cat([batch['labels'], batch['labels']], dim=-1)
-        batch['input_ids'] = batch['input_ids'][..., :context]
-        batch['labels'] = batch['labels'][..., :context]
-        batch['seq_len'] = context
+        loss = outputs.sum() / batch['seq_len']
 
-        history = History(1_000_000)
+        loss.backward()
+        history.step(loss.item(), batch['seq_len'])
 
-        for _ in range(3):
-            input_ids = list(my_chunkize(batch['input_ids']))
-            labels = list(my_chunkize(batch['labels']))
+        if (step + 1) % args.accum_grad:
+            optimizer.step()
+            zero_grad(params)
 
-            kv_cache = KVCache(
-                num_layers=model.model.config.num_hidden_layers,
-                batch_size=1,
-                page_size=64,
-                num_heads=model.model.config.num_key_value_heads,
-                chunk_size=args.chunk_size,
-                cpu_offload=2)
-
-            loss_accum = 0
-
-            history.init()
-            
-            with torch.no_grad():
-                for chunk_input, chunk_target in zip(input_ids, labels):
-
-                    # forward pass
-                    inputs = dict(
-                        input_ids=chunk_input,
-                        labels=chunk_target,
-                        kv_cache=kv_cache)
-                    model(**inputs)
-
-
-            for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
-
-                # forward prop
-                inputs = dict(
-                    input_ids=chunk_input,
-                    labels=chunk_target,
-                    kv_cache=kv_cache)
-                loss = model(**inputs).sum() / batch['seq_len']
-
-                # backward prop
-                kv_cache.pre_process()
-                loss.backward()
-                kv_cache.post_process()
-
-            history.step(loss_accum, batch['seq_len'])
-            del kv_cache
-            torch.cuda.empty_cache()
-
-        mean_time, mean_memory = history.summary(False)
-        current_memory_alloc = torch.cuda.memory_allocated()
-        template = colorize("yellow", f"{context:<5d}") + "{mean_time:<3.3f} | {mean_memory:.3f} | {current_memory_alloc:.3f}"
-        print(template.format(mean_time=mean_time, mean_memory=mean_memory, current_memory_alloc=current_memory_alloc))
+    output = json.dumps(history.loss)
+    print(output)
 
     backend_cleanup()

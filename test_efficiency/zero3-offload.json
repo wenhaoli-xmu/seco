@@ -22,8 +22,6 @@
         "enabled": true
     },
 
-    "enable_gradient_clipping_with_value": 1.0,
-
     "zero_optimization": {
         "stage": 3,  
         "offload_optimizer": {

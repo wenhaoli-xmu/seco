@@ -27,6 +27,7 @@ class CacheManager(torch.nn.Module):
 
         # NOTE: Called before accessing grad, can be used for debugging or CPU offloading.
         self.grad_hook = None
+        self.device = torch.device('cuda')
 
     def remove_last_update(self):
         if len(self.last_update_pages) == 1:
@@ -53,6 +54,8 @@ class CacheManager(torch.nn.Module):
     def update(self, key, val):
         assert key.dtype == torch.bfloat16, 'only bfloat16 is supported'
         update_token = key.shape[1]
+
+        self.device = key.device
 
         # pad key and value
         if update_token % self.page_size != 0:
@@ -108,12 +111,6 @@ class CacheManager(torch.nn.Module):
         self.kgd_tensors.update(kgd_tensors)
         self.vgd_tensors.update(vgd_tensors)
 
-        # update page table
-        nest_ptrs = [
-            (x.data_ptr(), y.data_ptr(), a.data_ptr(), b.data_ptr()) 
-            for x, y, a, b in zip(key, val, kgd, vgd)]
-        nest_ptrs = torch.tensor(nest_ptrs, dtype=int, device='cuda')
-
         self.last_update_token.append(update_token)
         self.last_update_pages.append(update_pages)
 
@@ -130,7 +127,11 @@ class CacheManager(torch.nn.Module):
                 self.kgd_tensors[str(i)].data_ptr(), 
                 self.vgd_tensors[str(i)].data_ptr()))
 
-        page_table = torch.tensor(page_table, dtype=int, device='cuda')
+        page_table = torch.tensor(
+            page_table, 
+            dtype=int, 
+            device=self.device)
+
         return page_table
     
     @property
@@ -213,11 +214,9 @@ class KVCache:
             page_size: int = 64,
             num_heads: int = 4,
             head_dim: int = 128,
-            chunk_size: int = 1024, 
             cpu_offload=None):
         
         self.num_layers = num_layers    
-        self.chunk_size = chunk_size
         self.cpu_offload = cpu_offload
 
         cuda_stream = Stream()
