@@ -1,6 +1,5 @@
 from torch.utils.data import ConcatDataset, DataLoader
 import torch.distributed as dist
-
 import torch
 
 
@@ -12,8 +11,6 @@ from chunkoptim.utils import (
     get_optimizer_and_lr_adjuster, 
     chunkize,
     History)
-
-from chunkoptim.kv_cache import KVCache
 
 import argparse, random, numpy, os, json
 from pygments.console import colorize
@@ -77,10 +74,7 @@ def backend_cleanup():
 
 
 if __name__ == '__main__':
-
-
     backend_setup()
-
 
     parser = argparse.ArgumentParser()
     parser.add_argument("--env-conf", type=str, required=True)
@@ -93,48 +87,41 @@ if __name__ == '__main__':
     parser.add_argument("--accum-grad", type=int, default=1)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--offload", action='store_true')
+    parser.add_argument("--grad-ckpt", action='store_true')
     parser.add_argument("--lr", type=float, default=1e-4)
 
     args = parser.parse_args()
 
-    
     env_conf = get_env_conf(args.env_conf)
     env_conf['train']['max_lr'] = args.lr
     env_conf['model']['device_map'] = {"": dist.get_rank()}
     dtype = get_torch_dtype(env_conf['model']['model_dtype'])
-
 
     # load model
     seed_everything(0)
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
     seed_everything(args.seed)
 
-
     model.eval()
-
+    
 
     params = model.ft_params()
     optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(**env_conf['train'], params=params)
 
-
     # build dataset
-    """
-    NOTE: Rank0 dataset loading is ahead of other ranks. This is because data buffer is saved after rank0 finishes,
-    thus others can utilize this buffer to avoid redundant processing and ensure consistency across ranks.
-    """
     if dist.get_rank() == 0:
         corpus = build_dataset(env_conf, tokenizer)
+        from chunkoptim.cache.kv_cache import KVCache
     dist.barrier()
     if dist.get_rank() != 0:
         corpus = build_dataset(env_conf, tokenizer)
+        from chunkoptim.cache.kv_cache import KVCache
     dist.barrier()
-
 
     loader = DataLoader(
         corpus, 
         batch_size=1, 
         collate_fn=collate_fn)
-
 
     base_memory_allocated = torch.cuda.max_memory_allocated()
     print(colorize("yellow", "Base GPU memory allocated:") + colorize("green", f"{base_memory_allocated // 1024 ** 2} MB"))
@@ -149,11 +136,11 @@ if __name__ == '__main__':
             num_layers=model.model.config.num_hidden_layers,
             batch_size=1,
             page_size=64,
-            num_heads=model.model.config.num_key_value_heads,
+            num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
             cpu_offload=2 if args.offload else None)
 
         history.init()
-        
+
         with torch.no_grad():
             for chunk_input, chunk_target in zip(input_ids, labels):
 
@@ -172,7 +159,8 @@ if __name__ == '__main__':
             inputs = dict(
                 input_ids=chunk_input,
                 labels=chunk_target,
-                kv_cache=kv_cache)
+                kv_cache=kv_cache,
+                grad_ckpt=args.grad_ckpt)
 
             outputs = model(**inputs)
 
@@ -186,10 +174,8 @@ if __name__ == '__main__':
         history.step(accum_loss, batch['seq_len'])
 
         if (step + 1) % args.accum_grad == 0:
-            mag = 0
-            for param in params:
-                mag += param.grad.abs().mean()
-            print(f'magnitude: {mag}')
+            if dist.get_world_size() > 1:
+                model.sync_gradient()
             optimizer.step()
             zero_grad(params)
 

@@ -1,44 +1,3 @@
-"""
-*Experimental* implementation of FlashAttention in Triton.
-Tested with triton==2.0.0.dev20221202.
-Triton 2.0 has a new backend (MLIR) but seems like it doesn't yet work for head dimensions
-other than 64:
-https://github.com/openai/triton/blob/d376020f90002757eea3ea9475d4f7cfc2ec5ead/python/triton/ops/flash_attention.py#L207
-We'll update this implementation with the new Triton backend once this is fixed.
-
-We use the FlashAttention implementation from Phil Tillet a starting point.
-https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py
-
-Changes:
-- Implement both causal and non-causal attention.
-- Implement both self-attention and cross-attention.
-- Support arbitrary seqlens (not just multiples of 128), for both forward and backward.
-- Support all head dimensions up to 128 (not just 16, 32, 64, 128), for both forward and backward.
-- Support attention bias.
-- Speed up the forward pass a bit, and only store the LSE instead of m and l.
-- Make the backward for d=128 much faster by reducing register spilling.
-- Optionally parallelize the backward pass across seqlen_k, to deal with the case of
-small batch size * nheads.
-
-Caution:
-- This is an *experimental* implementation. The forward pass should be quite robust but
-I'm not 100% sure that the backward pass doesn't have race conditions (due to the Triton compiler).
-- This implementation has only been tested on A100.
-- If you plan to use headdim other than 64 and 128, you should test for race conditions
-(due to the Triton compiler), as done in tests/test_flash_attn.py
-"test_flash_attn_triton_race_condition". I've tested and fixed many race conditions
-for different head dimensions (40, 48, 64, 128, 80, 88, 96), but I'm still not 100% confident
-that there are none left for other head dimensions.
-
-Differences between this Triton version and the CUDA version:
-- Triton version doesn't support dropout.
-- Triton forward is generally faster than CUDA forward, while Triton backward is
-generally slower than CUDA backward. Overall Triton forward + backward is slightly slower
-than CUDA forward + backward.
-- Triton version doesn't support different sequence lengths in a batch (i.e., RaggedTensor/NestedTensor).
-- Triton version supports attention bias, while CUDA version doesn't.
-"""
-
 import math
 
 import torch
@@ -49,9 +8,8 @@ from pygments.console import colorize
 IS_BF16_ATOM_ADD_SUPPORTED = triton.__version__ >= "3.4.0"
 
 if not IS_BF16_ATOM_ADD_SUPPORTED:
-    print(colorize('yellow', "[flash_paged_attn.py]: BF16 atomic add is not supported by Triton < 3.4.0, please upgrade Triton to 3.4.0 or later."), flush=True)
-    print(colorize('yellow', ">>>") + ' ' + "Press Enter to continue, or Ctrl+C to exit...", flush=True)
-    input()
+    print(colorize('yellow', "[flash_paged_attn.py]: (English) BF16 atomic add is not supported by Triton < 3.4.0, please upgrade Triton to 3.4.0 or later."), flush=True)
+    print(colorize('yellow', "[flash_paged_attn.py]: (Chinese) BF16 atomic add 不被 Triton < 3.4.0 所支持, 请将 Triton 更新至 3.4.0 或更新的版本."), flush=True)
 
 
 @triton.jit
@@ -735,7 +693,9 @@ class FlashPagedAttn(torch.autograd.Function):
             q, manager.page_table,
             manager.num_kv, manager.page_size, manager.num_kv_heads, manager.head_dim,
             bias=None, causal=True, softmax_scale=None)
-        
+
+        o = torch.zeros_like(q)
+
         ctx.save_for_backward(q, o, lse)
         ctx.manager = manager
 
@@ -761,7 +721,7 @@ class FlashPagedAttn(torch.autograd.Function):
                 softmax_scale=ctx.softmax_scale)
             
             dk, dv = ctx.manager.grad
-            
+ 
         return dq, dk, dv, None
 
 
@@ -770,81 +730,73 @@ flash_paged_attn_func = FlashPagedAttn.apply
 
 if __name__ == '__main__':
     from flash_attn import flash_attn_func
-    from chunkoptim.kv_cache import CacheManager
-    page_size = 64
+    from chunkoptim.cache.kv_cache import CacheManager
 
+    page_size = 64
     num_heads = 32
     num_kv_heads = 4
 
-    num_kv_cache = 12800
-    num_new_toks = 1024
+    num_kv_cache_list = [10240 * (i + 1) for i in range(100)]
+    num_new_toks = 4096
 
-    k_cache1 = torch.randn((1, num_kv_cache, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
-    v_cache1 = torch.randn((1, num_kv_cache, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
-    k_cache2 = torch.randn((1, num_kv_cache, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
-    v_cache2 = torch.randn((1, num_kv_cache, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
-    manager = CacheManager(1, page_size, num_kv_heads, 128)
+    for num_kv_cache in num_kv_cache_list:
+        k_cache = torch.randn((1, num_kv_cache, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
+        v_cache = torch.randn((1, num_kv_cache, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
+        manager = CacheManager(1, page_size, num_kv_heads, 128)
 
-    q = torch.randn((1, num_new_toks, num_heads, 128), device='cuda', dtype=torch.bfloat16)
-    k = torch.randn((1, num_new_toks, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
-    v = torch.randn((1, num_new_toks, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
+        q = torch.randn((1, num_new_toks, num_heads, 128), device='cuda', dtype=torch.bfloat16)
+        k = torch.randn((1, num_new_toks, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
+        v = torch.randn((1, num_new_toks, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
 
-    k_cache1.requires_grad_(True)
-    v_cache1.requires_grad_(True)
-    k_cache2.requires_grad_(True)
-    v_cache2.requires_grad_(True)
-    q.requires_grad_(True)
-    k.requires_grad_(True)
-    v.requires_grad_(True)
+        k_cache.requires_grad_(True)
+        v_cache.requires_grad_(True)
+        q.requires_grad_(True)
+        k.requires_grad_(True)
+        v.requires_grad_(True)
 
-    from profiler import WallTime
-    ref_time_bwd = WallTime('ref-bwd', cuda=0)
-    our_time_bwd = WallTime('our-bwd', cuda=0)
+        from profiler import WallTime
+        ref_time_fwd = WallTime(f'ref-fwd-{num_kv_cache}', cuda=0)
+        ref_time_bwd = WallTime(f'ref-bwd-{num_kv_cache}', cuda=0)
+        our_time_bwd = WallTime(f'our-bwd-{num_kv_cache}', cuda=0)
 
-    for _ in range(20):
+        for _ in range(3):
 
-        q.grad, k.grad, v.grad, k_cache1.grad, v_cache1.grad, k_cache2.grad, v_cache2.grad = None, None, None, None, None, None, None
-        ref_bwd = flash_attn_func(q, torch.cat((k_cache1, k_cache2, k), dim=1), torch.cat((v_cache1, v_cache2, v), dim=1), causal=True)
+            q.grad, k.grad, v.grad, k_cache.grad, v_cache.grad = None, None, None, None, None
 
-        with ref_time_bwd:
-            ref_bwd.sum().backward()
+            with ref_time_fwd:
+                ref_bwd = flash_attn_func(q, torch.cat((k_cache, k), dim=1), torch.cat((v_cache, v), dim=1), causal=True)
 
-        ref_grad_q = q.grad.clone()
-        ref_grad_k = k.grad.clone()
-        ref_grad_v = v.grad.clone()
-        ref_grad_kc1 = k_cache1.grad.clone()
-        ref_grad_vc1 = v_cache1.grad.clone()
-        ref_grad_kc2 = k_cache2.grad.clone()
-        ref_grad_vc2 = v_cache2.grad.clone()
+            with ref_time_bwd:
+                ref_bwd.sum().backward()
 
-        q.grad, k.grad, v.grad, k_cache1.grad, v_cache1.grad, k_cache2.grad, v_cache2.grad = None, None, None, None, None, None, None
-        manager.reset()
-        manager.update(k_cache1, v_cache1)
-        manager.update(k_cache2, v_cache2)
-        manager.update(k, v)
-        our_bwd = flash_paged_attn_func(q, k, v, manager)
-        
-        with our_time_bwd:
-            our_bwd.sum().backward()
+            ref_grad_q = q.grad.clone()
+            ref_grad_k = k.grad.clone()
+            ref_grad_v = v.grad.clone()
+            ref_grad_kc = k_cache.grad.clone()
+            ref_grad_vc = v_cache.grad.clone()
 
-        our_grad_q = q.grad.clone()
-        our_grad_k = k.grad.clone()
-        our_grad_v = v.grad.clone()
+            q.grad, k.grad, v.grad, k_cache.grad, v_cache.grad = None, None, None, None, None
+            manager.reset()
+            manager.update(k_cache, v_cache)
+            manager.update(k, v)
+            our_bwd = flash_paged_attn_func(q, k, v, manager)
+            
+            with our_time_bwd:
+                our_bwd.sum().backward()    
 
-        manager.remove_last_update()
-        our_grad_kc2, our_grad_vc2 = manager.grad
+            our_grad_q = q.grad.clone()
+            our_grad_k = k.grad.clone()
+            our_grad_v = v.grad.clone()
 
-        manager.remove_last_update()
-        our_grad_kc1, our_grad_vc1 = manager.grad
+            manager.remove_last_update()
+            our_grad_kc, our_grad_vc = manager.grad
 
-    print(torch.dist(ref_bwd, our_bwd))
-    print(torch.dist(ref_grad_q, our_grad_q))
-    print(torch.dist(ref_grad_k, our_grad_k))
-    print(torch.dist(ref_grad_v, our_grad_v))
-    print(torch.dist(ref_grad_kc1, our_grad_kc1))
-    print(torch.dist(ref_grad_vc1, our_grad_vc1))
-    print(torch.dist(ref_grad_kc2, our_grad_kc2))
-    print(torch.dist(ref_grad_vc2, our_grad_vc2))
+        print(torch.dist(ref_bwd, our_bwd))
+        print(torch.dist(ref_grad_q, our_grad_q))
+        print(torch.dist(ref_grad_k, our_grad_k))
+        print(torch.dist(ref_grad_v, our_grad_v))
+        print(torch.dist(ref_grad_kc, our_grad_kc))
+        print(torch.dist(ref_grad_vc, our_grad_vc))
 
-    ref_time_bwd.result(detail=True)
-    our_time_bwd.result(detail=True)
+        ref_time_fwd.result(detail=True)
+        our_time_bwd.result(detail=True)

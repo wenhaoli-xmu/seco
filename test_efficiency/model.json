@@ -1,6 +1,6 @@
 {
     "model": {
-        "model_name": "/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/Meta-Llama-3-8B/",
+        "model_name": "/mnt/petrelfs/share_data/wangweiyun/share_ckpt_hf/Meta-Llama-3-8B",
         "model_dtype": "bf16",
         "model_method": null,
         "model_structure": null,

@@ -7,6 +7,6 @@ deepspeed \
     --hostfile=$hostfile \
     --launcher SLURM \
     test_efficiency/test_ds.py \
-    --deepspeed_config test_efficiency/zero3.json \
+    --deepspeed_config test_efficiency/zero0.json \
     --context "[10240 * i for i in range(1,100)]" \
-    --config test_efficiency/config_baseline.json 
+    --config test_efficiency/config_ringflash.json 

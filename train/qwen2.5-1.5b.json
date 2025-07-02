@@ -1,17 +1,17 @@
 {
     "model": {
-        "model_name": "/mnt/petrelfs/share_data/ai4good_shared/models/meta-llama/Meta-Llama-3-8B/",
+        "model_name": "Qwen/Qwen2.5-1.5B",
         "model_dtype": "bf16",
-        "model_method": "train-ckpt",
+        "model_method": "blockwise-tp",
         "model_structure": null,
-        "save_ckp": "ckp/model.pth",
+        "save_ckp": "ckp/qwen2.5-1.5b-instruct-4m.pth",
         "load_ckp": null,
-        "config": "config/train.json",
+        "config": "config/full.json",
         "device_map": null
     },
 
     "train": {
-        "train_iters": 1000,
+        "train_iters": 128,
         "max_lr": null,
         "warmup": 0.01,
         "beta1": 0.9,
@@ -19,8 +19,8 @@
         "weight_decay": 0.05,
         "corpus": [
             {
-                "data": "data/pg19/train.json",
-                "conf": "config/slimpajama-trunc32768.json",
+                "data": "data/pg19/train-24m.json",
+                "conf": "config/slimpajama-trunc4m.json",
                 "partition": 1.0
             }
         ]
