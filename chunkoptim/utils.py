@@ -256,7 +256,8 @@ class History:
                 loss=self.loss[-1],
                 time=mean_time,
                 memory=min_memory,
-                seq_len=int(np.mean(self.seq_len))))
+                seq_len=int(np.mean(self.seq_len))),
+                flush=True)
 
         dist.barrier()
 

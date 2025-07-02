@@ -19,6 +19,7 @@ from chunkoptim.kv_cache import KVCache
 import argparse, random, numpy, os
 from pygments.console import colorize
 import deepspeed
+import torch.distributed as dist
 
 
 def zero_grad(params):
@@ -83,7 +84,6 @@ def launch_test(args, pipeline):
     env_conf['model']['device_map'] = {"": dist.get_rank()}
     args.context = eval(args.context)
 
-
     # load model
     seed_everything(0)
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
@@ -124,7 +124,7 @@ def launch_test(args, pipeline):
 
         history = History(1_000_000)
 
-        for _ in range(10):
+        for _ in range(3):
             
             history.init()
 
@@ -136,7 +136,8 @@ def launch_test(args, pipeline):
 
         mean_time, mean_memory = history.summary(False)
         template = colorize("yellow", f"{context:<5d}\t|") + "{mean_time:<3.3f}\t| {mean_memory:.3f}"
-        print(template.format(mean_time=mean_time, mean_memory=mean_memory))
+        if dist.get_rank() == 0:
+            print(template.format(mean_time=mean_time, mean_memory=mean_memory), flush=True)
 
     backend_cleanup()
 
@@ -196,6 +197,13 @@ def blockwise(model_engine, batch, kv_cache, grad_ckpt, block_size, page_size, c
         kv_cache.post_process()
 
 
+def ringflash(model_engine, batch):
+    loss = model_engine(
+        input_ids=batch['input_ids'],
+        labels=batch['labels'])
+    model_engine.backward(loss)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", type=str, default="[10240 * (i + 1) for i in range(10)]")
@@ -212,13 +220,16 @@ if __name__ == '__main__':
     args.env_conf['model']['model_method'] = method
     kwargs = args.config
 
-
     if method == 'baseline':
         pipe = baseline
 
     elif method == 'blockwise':
         pipe = blockwise
 
+    elif method == 'ringflash':
+        from ring_flash_attn import substitute_hf_flash_attn
+        substitute_hf_flash_attn(None, 1)
+        pipe = ringflash
 
     pipe = partial(pipe, **kwargs)
     launch_test(args, pipe)

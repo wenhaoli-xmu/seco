@@ -1,7 +1,7 @@
 import torch
 from torch.cuda import Stream
 from functools import partial
-from .flash_paged_attn import IS_BF16_ATOM_ADD_SUPPORTED
+from ..ops.flash_paged_attn import IS_BF16_ATOM_ADD_SUPPORTED
 
 
 class CacheManager(torch.nn.Module):
@@ -12,6 +12,7 @@ class CacheManager(torch.nn.Module):
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.reset()
+
 
     def reset(self):
         self.num_kv = 0
@@ -29,6 +30,8 @@ class CacheManager(torch.nn.Module):
         self.grad_hook = None
         self.device = torch.device('cuda')
 
+
+    @torch.inference_mode()
     def remove_last_update(self):
         if len(self.last_update_pages) == 1:
             self.reset()
@@ -51,6 +54,7 @@ class CacheManager(torch.nn.Module):
             del self.vgd_tensors[page_idx]
 
 
+    @torch.inference_mode()
     def update(self, key, val):
         assert key.dtype == torch.bfloat16, 'only bfloat16 is supported'
         update_token = key.shape[1]
@@ -115,6 +119,7 @@ class CacheManager(torch.nn.Module):
         self.last_update_pages.append(update_pages)
 
     @property
+    @torch.inference_mode()
     def page_table(self):
         num_pages = sum(self.last_update_pages)
         assert num_pages == len(self.key_tensors)
@@ -135,6 +140,7 @@ class CacheManager(torch.nn.Module):
         return page_table
     
     @property
+    @torch.inference_mode()
     def keys(self):
         page_indicies = range(sum(self.last_update_pages))
         ret = []
@@ -144,6 +150,7 @@ class CacheManager(torch.nn.Module):
         return ret
     
     @property
+    @torch.inference_mode()
     def values(self):
         page_indicies = range(sum(self.last_update_pages))
         ret = []
@@ -153,6 +160,7 @@ class CacheManager(torch.nn.Module):
         return ret
 
     @property
+    @torch.inference_mode()
     def grad(self):
         if self.grad_hook is not None:
             self.grad_hook()
@@ -174,31 +182,30 @@ class CacheManager(torch.nn.Module):
 
 
 class LayerCache(torch.nn.Module):
-    def __init__(self, batch_size, page_size, num_heads, head_dim, cuda_stream):
+    def __init__(self, batch_size, page_size, num_heads, head_dim):
         super().__init__()
         self.manager = CacheManager(
             batch_size=batch_size, 
             page_size=page_size, 
             num_kv_heads=num_heads, 
             head_dim=head_dim)
-        self.stream = cuda_stream
         self.reset()
 
     def reset(self):
         self.current_device = 'cuda'
         self.manager.reset()
 
-    def move_to_cpu(self):
+    def move_to_cpu(self, stream): 
         if self.current_device != 'cpu':
-            with torch.cuda.stream(self.stream):
+            with torch.cuda.stream(stream):
                 self.to('cpu', non_blocking=True)
         self.current_device = 'cpu'
 
-    def move_to_cuda(self):
+    def move_to_cuda(self, stream):
         if self.current_device != 'cuda':
             if self.length() > 0:
                 assert next(self.parameters()).is_pinned()
-            with torch.cuda.stream(self.stream):
+            with torch.cuda.stream(stream):
                 self.to('cuda', non_blocking=True)
         self.current_device = 'cuda'
 
@@ -208,26 +215,27 @@ class LayerCache(torch.nn.Module):
 
 class KVCache:
     def __init__(
-            self, 
-            num_layers: int = 28, 
-            batch_size: int = 1, 
-            page_size: int = 64,
-            num_heads: int = 4,
-            head_dim: int = 128,
-            cpu_offload=None):
-        
+        self, 
+        num_layers: int = 28, 
+        batch_size: int = 1, 
+        page_size: int = 64,
+        num_heads: int = 4,
+        head_dim: int = 128,
+        cpu_offload=None,
+        num_streams: int = 4):
+    
         self.num_layers = num_layers    
         self.cpu_offload = cpu_offload
 
-        cuda_stream = Stream()
+        self.streams = [Stream() for _ in range(num_streams)]
+        self.stream_idx = 0
 
         self.cache = [
             LayerCache(
                 batch_size,
                 page_size,
                 num_heads,
-                head_dim,
-                cuda_stream)
+                head_dim)
             for _ in range(num_layers)]
 
     def reset(self):
@@ -243,9 +251,13 @@ class KVCache:
             cpu_layers = filter(lambda x: x not in cuda_layers, range(self.num_layers))
 
             for lid in cpu_layers:
-                self.cache[lid].move_to_cpu()
+                stream = self.streams[self.stream_idx % len(self.streams)]
+                self.cache[lid].move_to_cpu(stream)
+                self.stream_idx += 1
             for lid in cuda_layers:
-                self.cache[lid].move_to_cuda()
+                stream = self.streams[self.stream_idx % len(self.streams)]
+                self.cache[lid].move_to_cuda(stream)
+                self.stream_idx += 1
 
     @property
     def device(self):

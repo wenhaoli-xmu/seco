@@ -5,11 +5,12 @@ torchrun \
     --rdzv-backend=c10d \
     --rdzv-endpoint=${MASTER_ADDR}:${MASTER_PORT} \
     --nnodes 1 \
-    --nproc_per_node 1 \
-    draw_curve/sparse.py \
-    --env-conf draw_curve/llama3-8b.json \
-    --accum-grad 4 \
-    --chunk-size 2048 \
+    --nproc_per_node 2 \
+    train/seco.py \
+    --env-conf train/qwen2.5-1.5b.json \
+    --accum-grad 1 \
+    --chunk-size 32768 \
+    --offload \
     --log-step 1 \
-    --seed 3 \
+    --seed 0 \
     --lr 2e-5
