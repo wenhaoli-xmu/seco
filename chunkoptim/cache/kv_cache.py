@@ -1,7 +1,7 @@
 import torch
 from torch.cuda import Stream
 from functools import partial
-from ..ops.flash_paged_attn import IS_BF16_ATOM_ADD_SUPPORTED
+from ..ops.utils import IS_BF16_ATOM_ADD_SUPPORTED
 
 
 class CacheManager(torch.nn.Module):

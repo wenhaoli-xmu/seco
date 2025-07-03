@@ -5,6 +5,9 @@ def get_modifier(method: str, model_type):
     
     elif method == 'blockwise-tp':
         from .train_blockwise_tp import ModelForTraining
+
+    elif method == 'blockwise-tp-sparse':
+        from .train_blockwise_tp_sparse import ModelForTraining
     
     elif method == 'baseline':
         from .train_baseline import ModelForTraining
@@ -17,5 +20,8 @@ def get_modifier(method: str, model_type):
     
     elif method == 'yarn-tp':
         from .train_yarn_tp import ModelForTraining
+
+    elif method == 'yarn-tp-sparse':
+        from .train_yarn_tp_sparse import ModelForTraining
         
     return ModelForTraining

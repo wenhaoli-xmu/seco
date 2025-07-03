@@ -2,7 +2,7 @@
     "model": {
         "model_name": "Qwen/Qwen2.5-1.5B",
         "model_dtype": "bf16",
-        "model_method": "yarn-tp",
+        "model_method": "yarn-tp-sparse",
         "model_structure": null,
         "save_ckp": "ckp/qwen2.5-1.5b-instruct-4m.pth",
         "load_ckp": null,

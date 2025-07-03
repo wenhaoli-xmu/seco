@@ -9,4 +9,4 @@ torchrun \
     --nproc_per_node 2 \
     test_efficiency/test.py \
     --context "[10240 * i for i in range(1,100)]" \
-    --config test_efficiency/config_blockwise_tp.json
+    --config test_efficiency/config_blockwise_tp_sparse.json

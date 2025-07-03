@@ -56,7 +56,7 @@ if __name__ == '__main__':
         tensor_shape = (1, num_kv_cache, num_kv_heads, head_dim)
         k_cache_cpu = torch.randn(tensor_shape, device='cpu', dtype=dtype).pin_memory()
         v_cache_cpu = torch.randn(tensor_shape, device='cpu', dtype=dtype).pin_memory()
-        
+
         total_size_mb = (k_cache_cpu.nelement() * 2 * k_cache_cpu.element_size()) / (1024 * 1024)
         
         profiler_name = f'cpu-to-gpu: {num_kv_cache} tokens ({total_size_mb:.2f} MB)'

@@ -9,7 +9,7 @@ torchrun \
     train/seco.py \
     --env-conf train/qwen2.5-1.5b.json \
     --accum-grad 1 \
-    --chunk-size 32768 \
+    --chunk-size 8192 \
     --offload \
     --log-step 1 \
     --seed 0 \
