@@ -88,7 +88,8 @@ if __name__ == '__main__':
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--offload", action='store_true')
     parser.add_argument("--grad-ckpt", action='store_true')
-    parser.add_argument("--lr", type=float, default=1e-4)
+    parser.add_argument("--lr", type=float, default=2e-5)
+    parser.add_argument("--page-budget", 128)
 
     args = parser.parse_args()
 
@@ -111,11 +112,11 @@ if __name__ == '__main__':
     # build dataset
     if dist.get_rank() == 0:
         corpus = build_dataset(env_conf, tokenizer)
-        from chunkoptim.cache.kv_cache import KVCache
+        from chunkoptim.cache.topk_cache import SparseKVCache
     dist.barrier()
     if dist.get_rank() != 0:
         corpus = build_dataset(env_conf, tokenizer)
-        from chunkoptim.cache.kv_cache import KVCache
+        from chunkoptim.cache.topk_cache import SparseKVCache
     dist.barrier()
 
     loader = DataLoader(
@@ -132,12 +133,13 @@ if __name__ == '__main__':
 
         input_ids = list(chunkize(batch['input_ids'], -1, args.chunk_size))
         labels = list(chunkize(batch['labels'], -1, args.chunk_size))
-        kv_cache = KVCache(
+        kv_cache = SparseKVCache(
             num_layers=model.model.config.num_hidden_layers,
             batch_size=1,
             page_size=64,
             num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
-            cpu_offload=2 if args.offload else None)
+            cpu_offload=2 if args.offload else None,
+            page_budget=args.page_budget)
 
         history.init()
 

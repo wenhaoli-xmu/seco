@@ -5,11 +5,7 @@ import triton
 import triton.language as tl
 from pygments.console import colorize
 
-IS_BF16_ATOM_ADD_SUPPORTED = triton.__version__ >= "3.4.0"
-
-if not IS_BF16_ATOM_ADD_SUPPORTED:
-    print(colorize('yellow', "[flash_paged_attn.py]: (English) BF16 atomic add is not supported by Triton < 3.4.0, please upgrade Triton to 3.4.0 or later."), flush=True)
-    print(colorize('yellow', "[flash_paged_attn.py]: (Chinese) BF16 atomic add 不被 Triton < 3.4.0 所支持, 请将 Triton 更新至 3.4.0 或更新的版本."), flush=True)
+from .utils import IS_BF16_ATOM_ADD_SUPPORTED
 
 
 @triton.jit
