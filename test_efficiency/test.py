@@ -4,7 +4,6 @@ import torch.distributed as dist
 import torch
 import json
 
-
 from corpus import get_processor, LazyRandomSampleCorpus
 from chunkoptim.utils import (
     get_model_and_tokenizer, 
@@ -13,9 +12,7 @@ from chunkoptim.utils import (
     History)
 from functools import partial
 from pathlib import Path
-
 from chunkoptim.cache.kv_cache import KVCache
-
 import argparse, random, numpy, os
 from pygments.console import colorize
 
@@ -124,7 +121,7 @@ def launch_test(args, pipeline):
 
         history = History(1_000_000)
 
-        for _ in range(10):
+        for _ in range(3):
             
             history.init()
 

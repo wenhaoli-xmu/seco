@@ -14,7 +14,7 @@ class SparseCacheManager(CacheManager):
     find the most relevant pages for a given query, always including the first and the most
     recent blocks.
     """
-    def __init__(self, batch_size, page_size, num_kv_heads, head_dim, sparse_topk):
+    def __init__(self, batch_size, page_size, num_kv_heads, head_dim, sparse_topk, offload=False):
         super().__init__(batch_size, page_size, num_kv_heads, head_dim)
         
         if sparse_topk <= 0:
@@ -22,12 +22,15 @@ class SparseCacheManager(CacheManager):
             
         self.sparse_topk = sparse_topk
         self.query_block_size = self.page_size
-        
-        self.k_block_summary_tensors = torch.nn.ParameterDict()
+        self.offload = offload
+        self.async_offload_stream = Stream()
+        self.k_block_summary_tensors = {}
+
         
     def reset(self):
         super().reset()
-        self.k_block_summary_tensors = torch.nn.ParameterDict()
+        self.k_block_summary_tensors = {}
+
 
     def remove_last_update(self):
         if not self.last_update_pages:
@@ -49,8 +52,14 @@ class SparseCacheManager(CacheManager):
 
     @torch.inference_mode()
     def update(self, key, val):
-        # Use the base class update for tensors
-        super().update(key, val)
+
+        if self.offload:
+            key_cpu = key.to('cpu', non_blocking=True)
+            val_cpu = val.to('cpu', non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+            super().update(key_cpu, val_cpu)
+        else:
+            super().update(key, val)
 
         # Now, handle the summary tensors specific to SparseCacheManager
         num_new_pages = (key.shape[1] + self.page_size - 1) // self.page_size
@@ -71,7 +80,7 @@ class SparseCacheManager(CacheManager):
 
 
     @torch.inference_mode()
-    def select_blocks(self, q: torch.Tensor) -> torch.Tensor:
+    def update_top_indices(self, q: torch.Tensor) -> torch.Tensor:
         num_blocks = len(self.k_block_summary_tensors)
         if num_blocks == 0:
             num_query_blocks = (q.shape[1] + self.query_block_size - 1) // self.query_block_size
@@ -101,29 +110,75 @@ class SparseCacheManager(CacheManager):
             torch.ones_like(block_scores,dtype=torch.bool).tril(block_scores.shape[-1] - block_scores.shape[-2]),
             block_scores,
             float('-inf'))
-        
+
         block_scores = torch.diagonal_scatter(
             block_scores, 
             torch.full((1, block_scores.shape[1], block_scores.shape[-2],), fill_value=float('inf'), dtype=block_scores.dtype, device=block_scores.device),
             offset=block_scores.shape[-1] - block_scores.shape[-2],
             dim1=2, dim2=3)
-        
+
         block_scores[:, :, :, 0] = float('inf')
 
-        top_indices = torch.topk(block_scores, k=k, dim=-1).indices.to(torch.int32)
-
-        return top_indices
+        self.top_indices = torch.topk(block_scores, k=k, dim=-1).indices.to(torch.int32)
+        self.top_indices_flat = set(self.top_indices.ravel().tolist())
     
+
+    def cpu_in_forward(self):
+        if self.offload:
+            with torch.cuda.stream(self.async_offload_stream):
+                for idx in self.top_indices_flat:
+                    idx = str(idx)
+                    self.key_tensors[idx].data = self.key_tensors[idx].data.to('cpu', non_blocking=True)
+                    self.val_tensors[idx].data = self.val_tensors[idx].data.to('cpu', non_blocking=True)
+
+    def cuda_in_forward(self):
+        if self.offload:
+            for idx in self.top_indices_flat:
+                idx = str(idx)
+                self.key_tensors[idx].data = self.key_tensors[idx].data.to('cuda', non_blocking=True)
+                self.val_tensors[idx].data = self.val_tensors[idx].data.to('cuda', non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+
+
+    def cpu_in_backward(self):
+        if self.offload:
+            with torch.cuda.stream(self.async_offload_stream):
+                for idx in self.top_indices_flat:
+                    idx = str(idx)
+                    self.key_tensors[idx].data = self.key_tensors[idx].data.to('cpu', non_blocking=True)
+                    self.val_tensors[idx].data = self.val_tensors[idx].data.to('cpu', non_blocking=True)
+                    self.kgd_tensors[idx].data = self.kgd_tensors[idx].data.to('cpu', non_blocking=True)
+                    self.vgd_tensors[idx].data = self.vgd_tensors[idx].data.to('cpu', non_blocking=True)
+
+
+    def cuda_in_backward(self):
+        if self.offload:
+            for idx in self.top_indices_flat:
+                idx = str(idx)
+                self.key_tensors[idx].data = self.key_tensors[idx].data.to('cuda', non_blocking=True)
+                self.val_tensors[idx].data = self.val_tensors[idx].data.to('cuda', non_blocking=True)
+                self.kgd_tensors[idx].data = self.kgd_tensors[idx].data.to('cuda', non_blocking=True)
+                self.vgd_tensors[idx].data = self.vgd_tensors[idx].data.to('cuda', non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+
+
 class SparseLayerCache(LayerCache):
-    def __init__(self, batch_size, page_size, num_heads, head_dim, page_budget):
+    def __init__(self, batch_size, page_size, num_heads, head_dim, page_budget, offload=False):
         torch.nn.Module.__init__(self)
         self.manager = SparseCacheManager(
             batch_size=batch_size, 
             page_size=page_size, 
             num_kv_heads=num_heads, 
             head_dim=head_dim,
-            sparse_topk=page_budget)
+            sparse_topk=page_budget,
+            offload=offload)
         self.reset()
+
+    def move_to_cpu(self, _):
+        self.current_device = 'cpu'
+
+    def move_to_cuda(self, _):
+        self.current_device = 'cuda'
 
 
 class SparseKVCache(KVCache):
@@ -134,15 +189,13 @@ class SparseKVCache(KVCache):
         page_size: int = 64,
         num_heads: int = 4,
         head_dim: int = 128,
-        cpu_offload=None,
-        num_streams: int = 4,
+        cpu_offload: bool = True,
         page_budget: int = 128):
     
-        self.num_layers = num_layers    
-        self.cpu_offload = cpu_offload
+        self.num_layers = num_layers
 
-        self.streams = [Stream() for _ in range(num_streams)]
-        self.stream_idx = 0
+        # disable automatic cpu offload
+        self.cpu_offload = None
 
         self.cache = [
             SparseLayerCache(
@@ -150,5 +203,6 @@ class SparseKVCache(KVCache):
                 page_size,
                 num_heads,
                 head_dim,
-                page_budget)
+                page_budget,
+                cpu_offload)
             for _ in range(num_layers)]

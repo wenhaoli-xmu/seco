@@ -15,36 +15,6 @@ from profiler import WallTime
 from abc import abstractmethod
 
 
-def build_mixed_float_mask(seq_len, chunk_indices):
-    """
-    Arguments
-    ---------
-    mask_4d: [1, 1, seqlen_q, seqlen_k]
-    chunk_indices: [1, chunk_size]
-
-    Return
-    ------
-    mixed_mask
-    """
-    window_size = chunk_indices.shape[-1]
-    chunk_mask_4d = torch.where(
-        torch.arange(seq_len, device=chunk_indices.device)[None, None, None, :] <= chunk_indices[:, None, :, None],
-        0,
-        float('-inf'))
-    chunk_mask_4d.scatter_(
-        dim=-1, 
-        index=chunk_indices[:, None, None, :].expand(-1, -1, window_size, -1), 
-        value=float('-inf'))
-    pad_mask_4d = torch.full(
-        size=(window_size, window_size), 
-        fill_value=float('-inf'),
-        dtype=chunk_mask_4d.dtype, 
-        device=chunk_mask_4d.device)
-    pad_mask_4d = pad_mask_4d.triu(1)[None, None, :, :].expand(chunk_mask_4d.shape[0], -1, -1, -1)
-    mixed_mask_4d = torch.cat([chunk_mask_4d, pad_mask_4d], dim=-1)
-    return mixed_mask_4d
-
-
 def average_filter(x, window):
     y = []
     w = []

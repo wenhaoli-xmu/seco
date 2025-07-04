@@ -28,7 +28,6 @@ class CacheManager(torch.nn.Module):
 
         # NOTE: Called before accessing grad, can be used for debugging or CPU offloading.
         self.grad_hook = None
-        self.device = torch.device('cuda')
 
 
     @torch.inference_mode()
@@ -55,11 +54,9 @@ class CacheManager(torch.nn.Module):
 
 
     @torch.inference_mode()
-    def update(self, key, val):
+    def update(self, key, val, as_buffer=True):
         assert key.dtype == torch.bfloat16, 'only bfloat16 is supported'
         update_token = key.shape[1]
-
-        self.device = key.device
 
         # pad key and value
         if update_token % self.page_size != 0:
@@ -94,21 +91,38 @@ class CacheManager(torch.nn.Module):
         self.num_kv += update_token
         update_pages = len(key)
 
-        key_tensors = {
-            str(sum(self.last_update_pages) + i): torch.nn.Buffer(x.data)
-            for i, x in enumerate(key)}
-        
-        val_tensors = {
-            str(sum(self.last_update_pages) + i): torch.nn.Buffer(x.data) 
-            for i, x in enumerate(val)}
-        
-        kgd_tensors = {
-            str(sum(self.last_update_pages) + i): torch.nn.Buffer(x.data) 
-            for i, x in enumerate(kgd)}
-        
-        vgd_tensors = {
-            str(sum(self.last_update_pages) + i): torch.nn.Buffer(x.data) 
-            for i, x in enumerate(vgd)}
+        if as_buffer:
+            key_tensors = {
+                str(sum(self.last_update_pages) + i): torch.nn.Buffer(x.data)
+                for i, x in enumerate(key)}
+            
+            val_tensors = {
+                str(sum(self.last_update_pages) + i): torch.nn.Buffer(x.data) 
+                for i, x in enumerate(val)}
+            
+            kgd_tensors = {
+                str(sum(self.last_update_pages) + i): torch.nn.Buffer(x.data) 
+                for i, x in enumerate(kgd)}
+            
+            vgd_tensors = {
+                str(sum(self.last_update_pages) + i): torch.nn.Buffer(x.data) 
+                for i, x in enumerate(vgd)}
+        else:
+            key_tensors = {
+                str(sum(self.last_update_pages) + i): x.data
+                for i, x in enumerate(key)}
+            
+            val_tensors = {
+                str(sum(self.last_update_pages) + i): x.data
+                for i, x in enumerate(val)}
+            
+            kgd_tensors = {
+                str(sum(self.last_update_pages) + i): x.data
+                for i, x in enumerate(kgd)}
+            
+            vgd_tensors = {
+                str(sum(self.last_update_pages) + i): x.data
+                for i, x in enumerate(vgd)}
         
         self.key_tensors.update(key_tensors)
         self.val_tensors.update(val_tensors)
@@ -135,7 +149,7 @@ class CacheManager(torch.nn.Module):
         page_table = torch.tensor(
             page_table, 
             dtype=int, 
-            device=self.device)
+            device='cuda')
 
         return page_table
     
@@ -171,6 +185,7 @@ class CacheManager(torch.nn.Module):
         page_indices = [str(page_idx) for page_idx in page_indicies]
         last_update_kgd = [self.kgd_tensors[page_idx] for page_idx in page_indices]
         last_update_vgd = [self.vgd_tensors[page_idx] for page_idx in page_indices]
+
         kgd = torch.cat(last_update_kgd, dim=1)[:, :self.last_update_token[-1]]
         vgd = torch.cat(last_update_vgd, dim=1)[:, :self.last_update_token[-1]]
 
