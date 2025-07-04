@@ -136,9 +136,9 @@ if __name__ == '__main__':
         kv_cache = SparseKVCache(
             num_layers=model.model.config.num_hidden_layers,
             batch_size=1,
-            page_size=64,
+            page_size=128,
             num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
-            cpu_offload=2 if args.offload else None,
+            cpu_offload=args.offload,
             page_budget=args.page_budget)
 
         history.init()
