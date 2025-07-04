@@ -3,5 +3,5 @@
     "block_size": 4096,
     "grad_ckpt": true,
     "page_size": 64, 
-    "cpu_offload": 2
+    "cpu_offload": null
 }

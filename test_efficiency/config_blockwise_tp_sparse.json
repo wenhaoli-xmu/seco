@@ -3,6 +3,6 @@
     "block_size": 4096,
     "grad_ckpt": true,
     "page_size": 64, 
-    "cpu_offload": null,
+    "cpu_offload": true,
     "page_budget": 128
 }

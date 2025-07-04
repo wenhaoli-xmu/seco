@@ -74,7 +74,7 @@ def init_to_zero(name):
 @triton.jit
 def _fwd_kernel_sparse(
     Q, T,
-    selected_block_indices, selected_block_mask,
+    selected_block_indices,
     Out, Lse,
     TMP,
     softmax_scale,
@@ -183,7 +183,7 @@ def _fwd_kernel_sparse(
 def _bwd_kernel_sparse(
     Q, DO, DQ,
     T, LSE, D,
-    selected_block_indices, selected_block_mask,
+    selected_block_indices, 
     softmax_scale,
     stride_qb, stride_qh, stride_qm,
     stride_dob, stride_doh, stride_dom,
@@ -285,7 +285,6 @@ def _flash_attn_forward_sparse(
         q: torch.Tensor,
         page_table: torch.Tensor,
         selected_block_indices: torch.Tensor,
-        selected_block_mask: torch.Tensor,
         page_size: int,
         num_kv_heads: int,
         kv_head_dim: int,
@@ -318,7 +317,7 @@ def _flash_attn_forward_sparse(
 
     _fwd_kernel_sparse[grid](
         q, page_table,
-        selected_block_indices, selected_block_mask,
+        selected_block_indices,
         o, lse,
         tmp,
         softmax_scale,
@@ -347,7 +346,6 @@ def _flash_attn_backward_sparse(
         dq: torch.Tensor,
         page_table: torch.Tensor,
         selected_block_indices: torch.Tensor,
-        selected_block_mask: torch.Tensor,
         page_size: int,
         num_kv_heads: int,
         kv_head_dim: int,
@@ -385,7 +383,7 @@ def _flash_attn_backward_sparse(
     _bwd_kernel_sparse[grid_bwd](
         q, do, dq,
         page_table, lse, delta,
-        selected_block_indices, selected_block_mask,
+        selected_block_indices,
         softmax_scale,
         q.stride(0), q.stride(2), q.stride(1),
         do.stride(0), do.stride(2), do.stride(1),
@@ -413,31 +411,24 @@ class FlashPagedSparseAttn(torch.autograd.Function):
             q: torch.Tensor,
             k: torch.Tensor,
             v: torch.Tensor,
-            manager,
-            sparse_indices=None,
-            sparse_mask=None):
+            manager):
 
         q = q if q.stride(-1) == 1 else q.contiguous()
-
-        if sparse_indices is None:
-            sparse_indices = manager.select_blocks(q)
-        
-        if sparse_mask is None:
-            sparse_mask = torch.ones_like(sparse_indices, dtype=torch.bool)
+        manager.update_top_indices(q)
+        manager.cuda_in_forward()
 
         o, lse, ctx.softmax_scale = _flash_attn_forward_sparse(
             q, page_table=manager.page_table,
-            selected_block_indices=sparse_indices, 
-            selected_block_mask=sparse_mask,
+            selected_block_indices=manager.top_indices, 
             page_size=manager.page_size, 
             num_kv_heads=manager.num_kv_heads, 
             kv_head_dim=manager.head_dim,
             q_start_idx=manager.num_kv - q.shape[1],
             softmax_scale=None)
 
+        manager.cpu_in_forward()
+
         ctx.save_for_backward(q, o, lse)
-        ctx.selected_block_indices = sparse_indices
-        ctx.selected_block_mask = sparse_mask
         ctx.manager = manager
 
         return o
@@ -446,22 +437,24 @@ class FlashPagedSparseAttn(torch.autograd.Function):
     def backward(ctx, do):
         q, o, lse = ctx.saved_tensors
 
-        with torch.inference_mode():
-            dq = torch.zeros_like(q)
-            
-            _flash_attn_backward_sparse(
-                o, do, q, dq,
-                ctx.manager.page_table,
-                ctx.selected_block_indices, 
-                ctx.selected_block_mask,
-                ctx.manager.page_size,
-                ctx.manager.num_kv_heads,
-                ctx.manager.head_dim,
-                ctx.manager.num_kv - q.shape[1],
-                lse,
-                ctx.softmax_scale)
+        dq = torch.zeros_like(q)
+        
+        ctx.manager.cuda_in_backward()
 
-            dk, dv = ctx.manager.grad
+        _flash_attn_backward_sparse(
+            o, do, q, dq,
+            ctx.manager.page_table,
+            ctx.manager.top_indices, 
+            ctx.manager.page_size,
+            ctx.manager.num_kv_heads,
+            ctx.manager.head_dim,
+            ctx.manager.num_kv - q.shape[1],
+            lse,
+            ctx.softmax_scale)
+        
+        dk, dv = ctx.manager.grad
+
+        ctx.manager.cpu_in_backward()
 
         return dq, dk, dv, None, None, None
 
@@ -518,9 +511,6 @@ if __name__ == '__main__':
     manager_sparse.update(k_cache, v_cache)
     manager_sparse.update(k_new, v_new)
 
-    selected_indices = manager_sparse.select_blocks(q)
-    selected_mask = torch.ones_like(selected_indices, dtype=torch.bool).contiguous()
-
     for _ in range(3):
         with profile_sparse:
             out_sparse = flash_paged_sparse_attn_func(q, None, None, manager_sparse)
@@ -533,7 +523,7 @@ if __name__ == '__main__':
     sparse_val = []
     last_q = q[:1, test_q_page: test_q_page + 1, test_q_head: test_q_head + 1, :]
 
-    indices_list = selected_indices[0, test_q_head, test_q_page].tolist()
+    indices_list = manager_sparse.top_indices[0, test_q_head, test_q_page].tolist()
     indices_list.sort()
     for idx in indices_list:
         key_page = full_key[:, page_size * idx: page_size * (idx + 1), (test_q_head//kv_groups): (test_q_head//kv_groups) + 1]

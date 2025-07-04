@@ -1,98 +1,103 @@
-![img](docs/main.png)
+# SeCO v2: 让LLM在单卡上训练4M上下文
 
-[Download Paper](https://github.com/wenhaoli-xmu/seco/raw/main/320.pdf)
+## Overview
 
-## 🤖Inst-Tuning Results
+* 在SeCO v1的基础上，加入了大量的优化技术，包括：
+    * paged kv cache & its gradients 管理，提高内存scale表现
+    * 独立于torch autograd system的kv cache管理，更加高效
+    * 支持cpu offload
 
-To more comprehensively validate the performance of SeCO and SpaCO, we further compared them with model parallel (running on 4 RTX 3090 GPUs, utilizing gradient checkpointing) in the instruction fine-tuning task. The results are shown in the figure below:
+* 支持tensor parallel
+    * 源代码在`chunkoptim/modifiers`文件夹下
+    * 能够将单卡内存减少接近一半
+    * 训练时间随着并行卡数增多近线性减少
 
-![img](docs/longbench.png)
+* 支持topk sparse attention
+    * 允许训练时间随着context length **近线性增长**
+    * 在sparse attention模式下，cpu offload的通信量不随着上下文增长而增长
 
-## 👁️Overview
+## 快速入门
 
-We propose SeCO and SpaCO for training LLMs under memory-constrained scenarios.
+1. 创建`KVCache`或者`SparseKVCache`对象
 
-### Sequential Chunk-wise Optimization (SeCO)
+    * `SparseKVCache`比`KVCache`多一个参数`page_budget`，表示attention计算采用的topk的page数
+    * `cpu_offload`参数可选 `2` 或者 `None`，分别表示启动offload或者关闭
+    * 要尽量在gpu:0加载kernel，这样其他gpu中的进程可以在gpu0加载好之后直接从缓存调用，从而避免一起加载导致的冲突
+    * 支持batch size > 1，但是在超长文本中 >1 的batch size没有什么实际意义
 
-* Employs a step-by-step strategy to execute forward propagation and localized backward propagation in chunks, with only one computational graph stored in GPU memory at any given time.
+    ```python
+    from chunkoptim.cache.kv_cache import KVCache
+    from chunkoptim.cache.topk_cache import SparseKVCache
 
-* Enables exact gradient computation, achieving gradient accuracy up to **12 decimal places** when using fp64 precision.
+    if dist.get_rank() == 0:
+        if dist.get_rank() == 0:
+            kv_cache = KVCache(
+                num_layers=model.model.config.num_hidden_layers,
+                batch_size=1,
+                page_size=page_size,
+                num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
+                cpu_offload=cpu_offload)
+        dist.barrier()
+        if dist.get_rank() != 0:
+            kv_cache = KVCache(
+                num_layers=model.model.config.num_hidden_layers,
+                batch_size=1,
+                page_size=page_size,
+                num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
+                cpu_offload=cpu_offload)
+        dist.barrier()
+    ```
 
-* Maintains near-native training speed when the chunk size is efficiently large, with no significant slowdown compared to conventional gradient checkpointing.
+2. 将输入切分成块
 
-### Sparse Chunk-wise Optimization (SpaCO)
+    * 可以直接使用我们在utils中提供了便捷的切分工具
+    * 这里的4096就是最终处理上下文的单位，对于内存更大的GPU，可以尽量调高此值，从而减少回合数
 
-* Extends SeCO by introducing sparsification during backward propagation.
+    ```python
+    from chunkoptim.utils import chunkize
+    from functools import partial
 
-* Gradually aligns training costs with inference costs as context length increases.
+    my_chunkize = partial(chunkize, dim=-1, chunk_size=4096)
 
-* While unable to compute exact gradients, the resulting trade-offs remain practically acceptable for most applications.
+    # input_ids: [bsz, n]
+    # labels: [bsz, n]
 
-Compared to mainstream training approaches, SeCO and SpaCO demonstrate substantial efficiency advantages:
+    input_ids = list(my_chunkize(input_ids))
+    labels = list(my_chunkize(labels))
+    ```
 
-![img](docs/efficiency.png)
+3. 编写block-wise training pipeline
 
+    * 对于任意technique的组合，例如 +TP, +sparse attention，或者同时使用两者，都可以凭这段代码实现
+    * `pre_process`函数的作用主要和cpu-offload有关
+    * `post_process`函数则主要与反向传播有关
 
-## 🚀Quick Start
-
-
-### Installation
-
-```bash
-
-$ git clone https://github.com/wenhaoli-xmu/seco.git
-$ cd seco
-$ pip install -e .
-$ pip install -r requirements.txt
-```
-
-### Example
-
-```python
-from chunkoptim.utils import chunkize, SecoCache
-
-
-chunk_size = 128
-
-
-for batch in data_loader:
-    
-    input_ids = list(chunkize(batch.input_ids, -1, chunk_size))
-    labels = list(chunkize(batch.labels, -1, chunk_size))
-    kv_cache = SecoCache(model.num_layers)
-
-    # forward prop
+    ```python
     with torch.no_grad():
         for chunk_input, chunk_target in zip(input_ids, labels):
+
+            # forward pass
             inputs = dict(
                 input_ids=chunk_input,
                 labels=chunk_target,
-                kv_cache=kv_cache)
+                kv_cache=kv_cache,
+                grad_ckpt=False)
             model(**inputs)
 
-    accum_loss = 0
+    for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
 
-    gen = reversed(list(enumerate(zip(input_ids, labels))))
-
-    for i, (chunk_input, chunk_target) in gen:
-
-        tmp_kv_cache = kv_cache.range(i)
-
-        # graph reconstruction
+        # forward prop
         inputs = dict(
             input_ids=chunk_input,
             labels=chunk_target,
-            kv_cache=tmp_kv_cache)
+            kv_cache=kv_cache,
+            grad_ckpt=grad_ckpt)
+        loss = model(**inputs).sum() / seq_len
 
-        loss = model(**inputs).sum() / batch['seq_len']
-        accum_loss += loss.item()
-
-
-        # localized backward prop
-        tmp_kv_cache.index(i).copy_scaled_grad(gd=kv_cache.index(i).grad)
+        # backward prop
+        kv_cache.pre_process()
         loss.backward()
+        kv_cache.post_process()
+    ```
 
-    optim.step()
-    optim.zero_grad()
-```
-
+    如果要支持deepspeed，则可以参考`test_efficiency/test_ds.py`中的pipeline，相比上面的代码只有少量更改
