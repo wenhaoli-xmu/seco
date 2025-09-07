@@ -2,13 +2,13 @@
     "concat": {
         "text": {
             "trunc_rear": true,
-            "trunc_txt": 24,
+            "trunc_txt": null,
             "train": true
         }
     },
     "truncation": {
         "enable": true,
-        "max_tokens": 1024,
+        "max_tokens": 524288,
         "order": ["text"]
     }
 }

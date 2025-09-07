@@ -11,6 +11,9 @@ def get_modifier(method: str, model_type):
     
     elif method == 'baseline':
         from .train_baseline import ModelForTraining
+
+    elif method == 'baseline-tp':
+        from .train_baseline_tp import ModelForTraining
     
     elif method == 'ringflash':
         from .train_ringflash import ModelForTraining

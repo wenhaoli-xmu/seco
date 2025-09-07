@@ -6,8 +6,7 @@ torchrun \
     --rdzv-backend=c10d \
     --rdzv-endpoint=${MASTER_ADDR}:${MASTER_PORT} \
     --nnodes 1 \
-    --nproc_per_node 2 \
+    --nproc_per_node 1 \
     test_efficiency/test.py \
-    --context "[10240 * i for i in range(1,100)]" \
-    # --config test_efficiency/config_blockwise_tp.json
-    --config test_efficiency/config_blockwise_tp_sparse.json
+    --context "[16384]" \
+    --config test_efficiency/config_blockwise_offload.json

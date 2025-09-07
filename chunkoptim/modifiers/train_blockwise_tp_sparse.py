@@ -7,7 +7,7 @@ from .utils import check_and_apply_qk_rope
 from peft import LoraConfig, get_peft_model, TaskType
 import torch.nn.functional as F
 from ..ops.flash_paged_topk import flash_paged_sparse_attn_func
-from ..ops.all_gather import _AllGather
+from ..ops.all_gather import all_gather_uneven
 from torch.utils.checkpoint import checkpoint
 
 
@@ -17,6 +17,31 @@ def get_tensor_parallel_world_size():
 
 def get_tensor_parallel_rank():
     return dist.get_rank() if dist.is_initialized() else 0
+
+
+class ColumnParallelLinearUneven(nn.Module):
+    def __init__(self, linear_layer: nn.Linear):
+        super().__init__()
+        self.world_size = get_tensor_parallel_world_size()
+        self.rank = get_tensor_parallel_rank()
+
+        if self.world_size <= 1:
+            self.weight = nn.Parameter(linear_layer.weight.data.clone())
+            self.bias = nn.Parameter(linear_layer.bias.data.clone()) if linear_layer.bias is not None else None
+            return
+        
+        weight_chunks = torch.chunk(linear_layer.weight.data, self.world_size, dim=0)
+        self.weight = nn.Parameter(weight_chunks[self.rank].clone())
+
+        if linear_layer.bias is not None:
+            bias_chunks = torch.chunk(linear_layer.bias.data, self.world_size, dim=0)
+            self.bias = nn.Parameter(bias_chunks[self.rank].clone())
+        else:
+            self.register_parameter('bias', None)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output_parallel = F.linear(x, self.weight, self.bias)
+        return output_parallel
 
 
 class ColumnParallelLinear(nn.Module):
@@ -114,7 +139,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
     num_kv_heads = self.config.num_key_value_heads // world_size
     embed_dim = self.config.hidden_size
     head_dim = embed_dim // self.config.num_attention_heads
-
+    
     ques = self.q_proj(hidden_states)
     keys = self.k_proj(hidden_states)
     vals = self.v_proj(hidden_states)
@@ -145,8 +170,6 @@ def self_attn_forward(self, hidden_states, kv_cache):
 def mlp_forward(self, hidden_state):
     gate_output = self.gate_proj(hidden_state)
     up_output = self.up_proj(hidden_state)
-    
-    # 逐元素相乘
     intermediate = self.act_fn(gate_output) * up_output
     
     return self.down_proj(intermediate)
@@ -191,7 +214,8 @@ class ModelForTraining(Modifier):
             layer.mlp.up_proj = ColumnParallelLinear(layer.mlp.up_proj)
             layer.mlp.down_proj = RowParallelLinear(layer.mlp.down_proj)
 
-        model.lm_head = ColumnParallelLinear(model.lm_head)
+        # 这个地方有修改
+        # model.lm_head = ColumnParallelLinearUneven(model.lm_head)
 
     def _init_lora(self, model, lora_rank, lora_alpha, lora_dropout):
         target_modules = r".*\.(self_attn|mlp)\.(q_proj|v_proj|gate_proj|up_proj)"
@@ -210,7 +234,18 @@ class ModelForTraining(Modifier):
             return self.model
 
     def ft_params(self):
-        return self.model.parameters()
+        params = []
+        for layer in self.model.model.layers:
+            params.extend([
+                layer.self_attn.q_proj.weight,
+                layer.self_attn.k_proj.weight,
+                layer.self_attn.v_proj.weight,
+                layer.self_attn.o_proj.weight,
+                layer.mlp.gate_proj.weight,
+                layer.mlp.up_proj.weight,
+                layer.mlp.down_proj.weight])
+        params.append(self.model.lm_head.weight)
+        return params
 
     def save_checkpoint(self, ckp_path: str):
         rank = get_tensor_parallel_rank()
@@ -295,7 +330,9 @@ class ModelForTraining(Modifier):
             input_ids=input_ids, 
             kv_cache=kv_cache, 
             grad_ckpt=grad_ckpt)
-        logits = _AllGather.apply(logits)
+        
+        # NOTE: 这个地方有修改
+        # logits = all_gather_uneven(logits)
 
         if labels is not None:
             logits = logits.to(labels.device)

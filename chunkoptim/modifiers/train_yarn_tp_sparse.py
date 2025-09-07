@@ -302,7 +302,18 @@ class ModelForTraining(Modifier):
             return self.model
 
     def ft_params(self):
-        return self.model.parameters()
+        params = []
+        for layer in self.model.model.layers:
+            params.extend([
+                layer.self_attn.q_proj.weight,
+                layer.self_attn.k_proj.weight,
+                layer.self_attn.v_proj.weight,
+                layer.self_attn.o_proj.weight,
+                layer.mlp.gate_proj.weight,
+                layer.mlp.up_proj.weight,
+                layer.mlp.down_proj.weight])
+        params.append(self.model.lm_head.weight)
+        return params
 
     def forward(self, input_ids, labels, kv_cache, grad_ckpt=False):
         logits = self.model(

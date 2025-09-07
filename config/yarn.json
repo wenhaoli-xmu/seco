@@ -1,9 +1,0 @@
-{
-    "lora": {
-        "enable": false,
-        "r": 8,
-        "a": 16,
-        "dropout": 0
-    },
-    "extend_to": 4194304
-}

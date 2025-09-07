@@ -8,7 +8,7 @@
     },
     "truncation": {
         "enable": true,
-        "max_tokens": 131077,
+        "max_tokens": 8192,
         "order": ["text"]
     }
 }

@@ -1,18 +1,3 @@
-"""
-*Experimental* implementation of FlashAttention in Triton.
-This file is modified to include a block-sparse version of paged attention.
-
-Original implementation from:
-https://github.com/openai/triton/blob/master/python/tutorials/06-fused-attention.py
-
-Key Modifications for Sparse Paged Attention:
-- Added `_fwd_kernel_sparse` and `_bwd_kernel_sparse` to handle block-sparse attention.
-- Assumes sparsity is defined at the query-block level: all queries in a block attend to the same set of KV blocks.
-- The new kernels take `selected_block_indices` and `selected_block_mask` as input.
-- Backward pass for sparse attention uses atomic adds for correctness on dK and dV.
-- A new user-facing function `flash_paged_sparse_attn_func` is added.
-"""
-
 import math
 
 import torch
@@ -414,6 +399,7 @@ class FlashPagedSparseAttn(torch.autograd.Function):
             manager):
 
         q = q if q.stride(-1) == 1 else q.contiguous()
+
         manager.update_top_indices(q)
         manager.cuda_in_forward()
 
@@ -427,7 +413,6 @@ class FlashPagedSparseAttn(torch.autograd.Function):
             softmax_scale=None)
 
         manager.cpu_in_forward()
-
         ctx.save_for_backward(q, o, lse)
         ctx.manager = manager
 
@@ -460,83 +445,3 @@ class FlashPagedSparseAttn(torch.autograd.Function):
 
 
 flash_paged_sparse_attn_func = FlashPagedSparseAttn.apply
-
-
-if __name__ == '__main__':
-    from profiler import WallTime
-    from flash_attn import flash_attn_func
-    from chunkoptim.cache.topk_cache import SparseCacheManager
-
-    profile_page = WallTime("page", cuda=0)
-    profile_sparse = WallTime("sparse", cuda=0)
-
-    page_size = 64
-    batch_size = 1
-    num_heads = 32
-    num_kv_heads = 4
-    head_dim = 128
-
-    num_kv_cache = 131072
-    num_new_toks = 1024
-
-    assert num_new_toks % page_size == 0, "num_new_toks must be a multiple of page_size"
-
-    total_kv_len = num_kv_cache + num_new_toks
-    num_kv_blocks = (total_kv_len + page_size - 1) // page_size
-
-    num_selected_blocks = 128
-    num_query_blocks = num_new_toks // page_size
-
-    k_cache = torch.randn((batch_size, num_kv_cache, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
-    v_cache = torch.randn((batch_size, num_kv_cache, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
-    
-    q = torch.randn((batch_size, num_new_toks, num_heads, head_dim), device='cuda', dtype=torch.bfloat16)
-    k_new = torch.randn((batch_size, num_new_toks, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
-    v_new = torch.randn((batch_size, num_new_toks, num_kv_heads, head_dim), device='cuda', dtype=torch.bfloat16)
-    
-    full_key = torch.cat([k_cache, k_new], dim=1)
-    full_val = torch.cat([v_cache, v_new], dim=1)
-
-    for _ in range(3):
-        with profile_page:
-            out_dense = flash_attn_func(q, full_key, full_val, causal=True)
-
-    manager_sparse = SparseCacheManager(
-        batch_size=batch_size, 
-        page_size=page_size, 
-        num_kv_heads=num_kv_heads, 
-        head_dim=head_dim, 
-        sparse_topk=num_selected_blocks
-    )
-    manager_sparse.update(k_cache, v_cache)
-    manager_sparse.update(k_new, v_new)
-
-    for _ in range(3):
-        with profile_sparse:
-            out_sparse = flash_paged_sparse_attn_func(q, None, None, manager_sparse)
-
-    test_q_head = 22
-    test_q_page = 14
-
-    kv_groups = num_heads // num_kv_heads
-    sparse_key = []
-    sparse_val = []
-    last_q = q[:1, test_q_page: test_q_page + 1, test_q_head: test_q_head + 1, :]
-
-    indices_list = manager_sparse.top_indices[0, test_q_head, test_q_page].tolist()
-    indices_list.sort()
-    for idx in indices_list:
-        key_page = full_key[:, page_size * idx: page_size * (idx + 1), (test_q_head//kv_groups): (test_q_head//kv_groups) + 1]
-        val_page = full_val[:, page_size * idx: page_size * (idx + 1), (test_q_head//kv_groups): (test_q_head//kv_groups) + 1]
-        sparse_key.append(key_page)
-        sparse_val.append(val_page)
-    sparse_key = torch.cat(sparse_key, dim=1)
-    sparse_val = torch.cat(sparse_val, dim=1)
-
-    out_sparse_2 = flash_attn_func(last_q, sparse_key, sparse_val, causal=True)
-
-    print(f"Output difference: {torch.dist(out_dense, out_sparse)}")
-    print(f"Output difference (sparse simulate): {torch.dist(out_sparse_2, out_sparse[:, test_q_page: test_q_page + 1, test_q_head: test_q_head + 1, :])}")
-
-    profile_sparse.result(detail=True)
-    profile_page.result(detail=True)

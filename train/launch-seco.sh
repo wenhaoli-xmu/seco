@@ -7,10 +7,12 @@ torchrun \
     --nnodes 1 \
     --nproc_per_node 1 \
     train/seco.py \
-    --env-conf train/qwen2.5-1.5b.json \
+    --env-conf train/qwen2.5-1.5b-seco-256k.json \
     --accum-grad 1 \
-    --chunk-size 32768 \
-    --offload \
+    --chunk-size 4096 \
     --log-step 1 \
     --seed 0 \
-    --lr 2e-5
+    --lr 5e-5 \
+    --page-budget 128 \
+    --grad-ckpt \
+    --offload

@@ -74,7 +74,6 @@ def backend_cleanup():
     dist.destroy_process_group()
 
 
-
 def launch_test(args, pipeline):
     backend_setup()
     
@@ -86,7 +85,6 @@ def launch_test(args, pipeline):
     # load model
     seed_everything(0)
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
-    seed_everything(dist.get_rank())
     model.train()
 
     """
@@ -133,9 +131,26 @@ def launch_test(args, pipeline):
 
         mean_time, mean_memory = history.summary(False)
         template = colorize("yellow", f"{context:<5d}\t|") + "{mean_time:<3.3f}\t| {mean_memory:.3f}"
-        print(template.format(mean_time=mean_time, mean_memory=mean_memory))
 
     backend_cleanup()
+
+
+def get_grad(params):
+    grads = []
+    for param in params:
+        if param.grad is not None and param.grad.data is not None:
+            grads.append(param.grad.data.ravel())
+        else:
+            grads.append(torch.zeros_like(param).ravel())
+    return torch.cat(grads, dim=0)
+
+
+def print_grad(params):
+    for param in params:
+        if param.grad is not None and param.grad.data is not None:
+            print(param.abs().sum().item())
+        else:
+            print("none")
 
 
 def baseline(model, batch, grad_ckpt, page_size):
@@ -168,7 +183,6 @@ def blockwise(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
 
     with torch.no_grad():
         for chunk_input, chunk_target in zip(input_ids, labels):
-
             # forward pass
             inputs = dict(
                 input_ids=chunk_input,
@@ -178,7 +192,6 @@ def blockwise(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
             model(**inputs)
 
     for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
-
         # forward prop
         inputs = dict(
             input_ids=chunk_input,
@@ -200,12 +213,14 @@ def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_s
 
     from chunkoptim.cache.topk_cache import SparseKVCache
 
+    world_size = dist.get_world_size()
+
     if dist.get_rank() == 0:
         kv_cache = SparseKVCache(
             num_layers=model.model.config.num_hidden_layers,
             batch_size=1,
             page_size=page_size,
-            num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
+            num_heads=model.model.config.num_key_value_heads// world_size,
             cpu_offload=cpu_offload,
             page_budget=page_budget)
     dist.barrier()
@@ -214,7 +229,7 @@ def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_s
             num_layers=model.model.config.num_hidden_layers,
             batch_size=1,
             page_size=page_size,
-            num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
+            num_heads=model.model.config.num_key_value_heads // world_size,
             cpu_offload=cpu_offload,
             page_budget=page_budget)
     dist.barrier()

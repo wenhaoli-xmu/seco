@@ -67,7 +67,7 @@ class SparseCacheManager(CacheManager):
         key_pages = list(torch.chunk(key_padded, chunks=num_new_pages, dim=1))
 
         key_summaries = [k_page.mean(dim=1, keepdim=True) for k_page in key_pages]
-        
+
         # The number of pages before this update
         current_num_pages = len(self.k_block_summary_tensors)
         summary_tensors = {

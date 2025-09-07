@@ -6,10 +6,9 @@ from ..modifier import Modifier
 from .utils import check_and_apply_qk_rope
 from peft import LoraConfig, get_peft_model, TaskType
 import torch.nn.functional as F
-from ..ops.flash_paged_attn import flash_paged_attn_func
-from ..ops.all_gather import _AllGather
+from flash_attn import flash_attn_func
+from ..ops.all_gather import all_gather_uneven
 from torch.utils.checkpoint import checkpoint
-import math
 
 
 def get_tensor_parallel_world_size():
@@ -20,89 +19,29 @@ def get_tensor_parallel_rank():
     return dist.get_rank() if dist.is_initialized() else 0
 
 
-def _yarn_find_correction_dim(num_rotations, dim, base=10000, max_position_embeddings=2048):
-    return (dim * math.log(max_position_embeddings/(num_rotations * 2 * math.pi)))/(2 * math.log(base))
-
-
-def _yarn_find_correction_range(low_rot, high_rot, dim, base=10000, max_position_embeddings=2048):
-    low = math.floor(_yarn_find_correction_dim(
-        low_rot, dim, base, max_position_embeddings))
-    high = math.ceil(_yarn_find_correction_dim(
-        high_rot, dim, base, max_position_embeddings))
-    return max(low, 0), min(high, dim-1)
-
-
-def _yarn_linear_ramp_mask(min, max, dim):
-    if min == max:
-        max += 0.001
-
-    linear_func = (torch.arange(dim, dtype=torch.float32) - min) / (max - min)
-    ramp_func = torch.clamp(linear_func, 0, 1)
-    return ramp_func
-
-
-def _yarn_get_mscale(scale=1):
-    if scale <= 1:
-        return 1.0
-    return 0.1 * math.log(scale) + 1.0
-
-
-class LlamaYaRNScaledRotaryEmbedding(torch.nn.Module):
-    def __init__(self, dim, max_position_embeddings=2048, base=10000, scale=1, original_max_position_embeddings=2048, extrapolation_factor=1, attn_factor=1, beta_fast=32, beta_slow=1, finetuned=False, device=None):
+class ColumnParallelLinearUneven(nn.Module):
+    def __init__(self, linear_layer: nn.Linear):
         super().__init__()
+        self.world_size = get_tensor_parallel_world_size()
+        self.rank = get_tensor_parallel_rank()
 
-        self.dim = dim
-        self.max_position_embeddings = max_position_embeddings
-        self.base = base
-        self.scale = scale
-        self.original_max_position_embeddings = original_max_position_embeddings
-        self.extrapolation_factor = extrapolation_factor
-        self.attn_factor = attn_factor
-        self.beta_fast = beta_fast
-        self.beta_slow = beta_slow
+        if self.world_size <= 1:
+            self.weight = nn.Parameter(linear_layer.weight.data.clone())
+            self.bias = nn.Parameter(linear_layer.bias.data.clone()) if linear_layer.bias is not None else None
+            return
+        
+        weight_chunks = torch.chunk(linear_layer.weight.data, self.world_size, dim=0)
+        self.weight = nn.Parameter(weight_chunks[self.rank].clone())
 
-        self.yarn(device)
+        if linear_layer.bias is not None:
+            bias_chunks = torch.chunk(linear_layer.bias.data, self.world_size, dim=0)
+            self.bias = nn.Parameter(bias_chunks[self.rank].clone())
+        else:
+            self.register_parameter('bias', None)
 
-        # Build here to make `torch.jit.trace` work.
-        self.max_seq_len_cached = max_position_embeddings
-        t = torch.arange(self.max_seq_len_cached, device=self.inv_freq.device, dtype=self.inv_freq.dtype)
-        freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-        # Different from paper, but it uses a different permutation in order to obtain the same calculation
-        emb = torch.cat((freqs, freqs), dim=-1)
-        dtype = torch.get_default_dtype()
-
-        self.register_buffer("cos_cached", (emb.cos() * self.mscale).to(dtype), persistent=False)
-        self.register_buffer("sin_cached", (emb.sin() * self.mscale).to(dtype), persistent=False)
-
-    def forward(self, x, seq_len=None):
-        # x: [bs, num_attention_heads, seq_len, head_size]
-        # This `if` block is unlikely to be run after we build sin/cos in `__init__`. Keep the logic here just in case.
-        if seq_len > self.max_seq_len_cached:
-            self.max_seq_len_cached = seq_len
-
-            t = torch.arange(self.max_seq_len_cached, device=x.device, dtype=self.inv_freq.dtype)
-            freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            # Different from paper, but it uses a different permutation in order to obtain the same calculation
-            emb = torch.cat((freqs, freqs), dim=-1).to(x.device)
-
-            self.register_buffer("cos_cached", (emb.cos() * self.mscale).to(x.dtype), persistent=False)
-            self.register_buffer("sin_cached", (emb.sin() * self.mscale).to(x.dtype), persistent=False)
-        return (
-            self.cos_cached[:seq_len].to(dtype=x.dtype),
-            self.sin_cached[:seq_len].to(dtype=x.dtype),
-        )
-
-    def yarn(self, device):
-        pos_freqs = self.base ** (torch.arange(0, self.dim, 2).float().to(device) / self.dim)
-        inv_freq_extrapolation = 1.0 / pos_freqs
-        inv_freq_interpolation = 1.0 / (self.scale * pos_freqs)
-
-        low, high = _yarn_find_correction_range(self.beta_fast, self.beta_slow, self.dim, self.base, self.original_max_position_embeddings)
-        inv_freq_mask = (1 - _yarn_linear_ramp_mask(low, high, self.dim // 2).float().to(device)) * self.extrapolation_factor # Get n-d rotational scaling corrected for extrapolation
-        inv_freq = inv_freq_interpolation * (1 - inv_freq_mask) + inv_freq_extrapolation * inv_freq_mask
-
-        self.register_buffer("inv_freq", inv_freq, persistent=False)
-        self.mscale = float(_yarn_get_mscale(self.scale) * self.attn_factor)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        output_parallel = F.linear(x, self.weight, self.bias)
+        return output_parallel
 
 
 class ColumnParallelLinear(nn.Module):
@@ -200,7 +139,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
     num_kv_heads = self.config.num_key_value_heads // world_size
     embed_dim = self.config.hidden_size
     head_dim = embed_dim // self.config.num_attention_heads
-
+    
     ques = self.q_proj(hidden_states)
     keys = self.k_proj(hidden_states)
     vals = self.v_proj(hidden_states)
@@ -221,7 +160,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
     if not torch.is_grad_enabled():
         manager.update(keys, vals)
 
-    attn_output = flash_paged_attn_func(ques, keys, vals, manager)
+    attn_output = flash_attn_func(ques, keys, vals, causal=True)
     attn_output = attn_output.flatten(2)
     
     attn_output = self.o_proj(attn_output)
@@ -231,8 +170,6 @@ def self_attn_forward(self, hidden_states, kv_cache):
 def mlp_forward(self, hidden_state):
     gate_output = self.gate_proj(hidden_state)
     up_output = self.up_proj(hidden_state)
-    
-    # 逐元素相乘
     intermediate = self.act_fn(gate_output) * up_output
     
     return self.down_proj(intermediate)
@@ -246,12 +183,6 @@ class ModelForTraining(Modifier):
         model.forward = types.MethodType(model_forward, model)
         model.model.forward = types.MethodType(model_model_forward, model.model)
         self.num_layers = len(model.model.layers)
-
-        model.model.rotary_emb = LlamaYaRNScaledRotaryEmbedding(
-            dim=model.config.hidden_size // model.config.num_attention_heads,
-            max_position_embeddings=self.conf['extend_to'], # 4M
-            scale=self.conf['extend_to'] // model.config.max_position_embeddings,
-            original_max_position_embeddings=model.config.max_position_embeddings)
 
         for layer in model.model.layers:
             layer.forward = types.MethodType(layer_forward, layer)
@@ -283,7 +214,7 @@ class ModelForTraining(Modifier):
             layer.mlp.up_proj = ColumnParallelLinear(layer.mlp.up_proj)
             layer.mlp.down_proj = RowParallelLinear(layer.mlp.down_proj)
 
-        model.lm_head = ColumnParallelLinear(model.lm_head)
+        model.lm_head = ColumnParallelLinearUneven(model.lm_head)
 
     def _init_lora(self, model, lora_rank, lora_alpha, lora_dropout):
         target_modules = r".*\.(self_attn|mlp)\.(q_proj|v_proj|gate_proj|up_proj)"
@@ -315,12 +246,91 @@ class ModelForTraining(Modifier):
         params.append(self.model.lm_head.weight)
         return params
 
+    def save_checkpoint(self, ckp_path: str):
+        rank = get_tensor_parallel_rank()
+        world_size = get_tensor_parallel_world_size()
+        
+        model = self._get_model()
+        state_dict = model.state_dict()
+        
+        if rank == 0:
+            print(f"Gathering weights and saving checkpoint to {ckp_path}...")
+            full_state_dict = {}
+        
+        for key, param in state_dict.items():
+            module_name, _, _ = key.rpartition('.')
+            try:
+                module = model.get_submodule(module_name)
+            except AttributeError:
+                module = None
+
+            if isinstance(module, (ColumnParallelLinear, RowParallelLinear)):
+                shards = [torch.empty_like(param) for _ in range(world_size)]
+                dist.all_gather(shards, param.data)
+                
+                if rank == 0:
+                    if isinstance(module, ColumnParallelLinear):
+                        full_param = torch.cat(shards, dim=0)
+                    else:
+                        full_param = torch.cat(shards, dim=1)
+                    full_state_dict[key] = full_param
+            else:
+                if rank == 0:
+                    full_state_dict[key] = param.data
+
+        if rank == 0:
+            torch.save(full_state_dict, ckp_path)
+            print(f"Checkpoint successfully saved.")
+
+    def load_checkpoint(self, ckp_path: str):
+        rank = get_tensor_parallel_rank()
+        world_size = get_tensor_parallel_world_size()
+        model = self._get_model()
+
+        if rank == 0:
+            print(f"Loading checkpoint from {ckp_path} on rank 0...")
+            full_state_dict = torch.load(ckp_path, map_location='cpu')
+        
+        for key, param in model.named_parameters():
+            module_name, _, _ = key.rpartition('.')
+            try:
+                module = model.get_submodule(module_name)
+            except AttributeError:
+                module = None
+
+            if isinstance(module, (ColumnParallelLinear, RowParallelLinear)):
+                if rank == 0:
+                    full_param = full_state_dict[key]
+                    if isinstance(module, ColumnParallelLinear):
+                        shards = torch.chunk(full_param, world_size, dim=0)
+                    else:
+                        shards = torch.chunk(full_param, world_size, dim=1)
+                    shards = [s.contiguous() for s in shards]
+                else:
+                    shards = None
+                
+                shard_to_load = torch.empty_like(param.data)
+                dist.scatter(shard_to_load, scatter_list=shards, src=0)
+                param.data.copy_(shard_to_load)
+            else:
+                if rank == 0:
+                    full_param = full_state_dict[key]
+                else:
+                    full_param = torch.empty_like(param.data)
+                
+                dist.broadcast(full_param, src=0)
+                param.data.copy_(full_param)
+        
+        if rank == 0:
+            print("Model state loaded successfully across all ranks.")
+
     def forward(self, input_ids, labels, kv_cache, grad_ckpt=False):
         logits = self.model(
             input_ids=input_ids, 
             kv_cache=kv_cache, 
             grad_ckpt=grad_ckpt)
-        logits = _AllGather.apply(logits)
+        
+        logits = all_gather_uneven(logits)
 
         if labels is not None:
             logits = logits.to(labels.device)

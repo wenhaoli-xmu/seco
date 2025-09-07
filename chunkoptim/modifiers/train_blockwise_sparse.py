@@ -4,12 +4,13 @@ import torch.distributed
 from ..modifier import Modifier
 from .utils import check_and_apply_qk_rope, do_projection, generate_mask
 from peft import LoraConfig, get_peft_model, TaskType
-from flash_attn import flash_attn_func
-
-from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
-from ..cache.kv_cache import CacheManager, KVCache
-from ..ops.flash_paged_attn import flash_paged_attn_func
+from ..ops.flash_paged_topk import flash_paged_sparse_attn_func
+from torch.utils.checkpoint import checkpoint
+
+
+torch.backends.cudnn.deterministic = True
+torch.backends.cudnn.benchmark = False
 
 
 def model_forward(self, input_ids, kv_cache, grad_ckpt, **kwargs):
@@ -23,7 +24,6 @@ def model_forward(self, input_ids, kv_cache, grad_ckpt, **kwargs):
     hidden_states = self.model(input_ids, kv_cache, grad_ckpt)
     logits = self.lm_head(hidden_states)
     return logits
-
 
 
 def model_model_forward(self, input_ids, kv_cache, grad_ckpt):
@@ -40,7 +40,7 @@ def model_model_forward(self, input_ids, kv_cache, grad_ckpt):
                 use_reentrant=False)
         else:
             hidden_states = layer(
-                hidden_states, 
+                hidden_states,
                 kv_cache)
         
     hidden_states = self.norm(hidden_states)
@@ -48,14 +48,12 @@ def model_model_forward(self, input_ids, kv_cache, grad_ckpt):
     return hidden_states
 
 
-
 def layer_forward(self, hidden_states, kv_cache):
     residual = hidden_states
-
     hidden_states = self.input_layernorm(hidden_states)
     hidden_states = self.self_attn(hidden_states, kv_cache)
     hidden_states = residual.to(hidden_states.device) + hidden_states
-    
+
     residual = hidden_states
     hidden_states = self.post_attention_layernorm(hidden_states)
     hidden_states = self.mlp(hidden_states)
@@ -104,17 +102,31 @@ def self_attn_forward(self, hidden_states, kv_cache):
     keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
     vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
 
+    # past length
+    past_length = kv_cache.length(self.layer_idx)
+    if torch.is_grad_enabled():
+        # NOTE: stage-2: second forward prop
+        past_length -= ques.shape[1]
+
     # position embedding
-    pos = torch.arange(0, keys.shape[1])
+    pos = torch.arange(past_length, past_length + keys.shape[1])
     pos = pos[None, :].to(keys.device)
     cos, sin = self.rotary_emb(keys, pos)
+
     ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
 
-    # manager = kv_cache[self.layer_idx]
-    # manager.update(keys, vals)
+    # GQA
+    manager = kv_cache[self.layer_idx]
 
-    attn_output = flash_attn_func(ques, keys, vals, causal=True)
-    # attn_output = flash_paged_attn_func(ques, keys, vals, manager)
+    if not torch.is_grad_enabled():
+        # NOTE: stage-1: first forward prop
+        manager.update(keys, vals)
+
+    attn_output = flash_paged_sparse_attn_func(
+        ques,
+        keys,
+        vals,
+        manager)
 
     attn_output = attn_output.flatten(2)
     attn_output = self.o_proj(attn_output)
@@ -142,6 +154,7 @@ class ModelForTraining(Modifier):
 
         super().__init__(model, save_ckp, load_ckp)
 
+
     def _init_lora(self, model, lora_rank, lora_alpha, lora_dropout):
         target_modules = r".*\.(self_attn|mlp)\.(q|v)_proj"
         peft_config = LoraConfig(
@@ -152,32 +165,45 @@ class ModelForTraining(Modifier):
             target_modules=target_modules)
         return get_peft_model(model, peft_config)
 
+
     def _get_model(self):
         if self.conf['lora']['enable']:
             return self.model.model
         else:
             return self.model
 
+
     def ft_params(self):
         params = []
         for layer in self.model.model.layers:
-            params.extend([
+            params += [
                 layer.self_attn.q_proj.weight,
                 layer.self_attn.k_proj.weight,
                 layer.self_attn.v_proj.weight,
                 layer.self_attn.o_proj.weight,
                 layer.mlp.gate_proj.weight,
                 layer.mlp.up_proj.weight,
-                layer.mlp.down_proj.weight])
+                layer.mlp.down_proj.weight]
         params.append(self.model.lm_head.weight)
         return params
 
+
     def forward(self, input_ids, labels, kv_cache, grad_ckpt=False):
 
-        # compute logits
-        logits = self.model(input_ids=input_ids, kv_cache=kv_cache, grad_ckpt=grad_ckpt).to(labels.device)
-        
-        # compute loss
-        logits = logits.squeeze(0)
-        labels = labels.squeeze(0)
-        return torch.nn.functional.cross_entropy(logits, labels, reduce=False)
+        logits = self.model(
+            input_ids=input_ids, 
+            kv_cache=kv_cache, 
+            grad_ckpt=grad_ckpt).to(input_ids.device)
+
+        if labels is not None:
+            logits = logits.to(labels.device)
+            logits = logits.squeeze(0)
+            labels = labels.squeeze(0)
+            return torch.nn.functional.cross_entropy(logits, labels, reduce=False)
+        else:
+            return logits[:, -1:, :]
+
+
+    @torch.no_grad()
+    def generate(self, input_ids, tokenizer, max_new_tokens=128, eos_token_id=[2]):
+        raise NotImplementedError

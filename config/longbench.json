@@ -1,5 +1,0 @@
-{
-    "conversation": {
-        "template": "llama3-inst.jinja"
-    }
-}

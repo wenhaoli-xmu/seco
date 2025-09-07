@@ -150,7 +150,7 @@ def adjust_lr(optim, step, total, max_lr, min_lr, restart, warmup, plateau):
 
 
 def get_optimizer_and_lr_adjuster(max_lr, train_iters, warmup, weight_decay, beta1, beta2, params, **kwargs):
-    optim = torch.optim.AdamW(params, lr=max_lr, betas=[beta1, beta2], weight_decay=weight_decay)
+    optim = torch.optim.AdamW(params, lr=max_lr, betas=[beta1, beta2], weight_decay=weight_decay, fused=True)
     lr_adjuster = partial(adjust_lr, optim=optim, total=train_iters, max_lr=max_lr, min_lr=0, restart=1, warmup=warmup, plateau=0)
     return optim, lr_adjuster
 
@@ -205,7 +205,7 @@ class History:
         mean_time = np.mean(times) if len(times) > 0 else 0.0
         min_memory = min(self.memory) / 1024 ** 2
 
-        if dist.get_rank() == 0 and pr1nt:
+        # if dist.get_rank() == 0 and pr1nt:
             # plt.figure()
             # plt.subplot(131)
             # plt.title("loss")
@@ -221,13 +221,13 @@ class History:
 
             # plt.savefig(self.path.format(step=self._step))
 
-            print(self.template.format(
-                step=self._step,
-                loss=self.loss[-1],
-                time=mean_time,
-                memory=min_memory,
-                seq_len=int(np.mean(self.seq_len))),
-                flush=True)
+        print(self.template.format(
+            step=self._step,
+            loss=self.loss[-1],
+            time=mean_time,
+            memory=min_memory,
+            seq_len=int(np.mean(self.seq_len))),
+            flush=True)
 
         dist.barrier()
 

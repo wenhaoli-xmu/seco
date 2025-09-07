@@ -267,15 +267,16 @@ class ModelForTraining(Modifier):
 
     def ft_params(self):
         params = []
-        for layer in self._get_model().model.layers:
-            if self.conf['lora']['enable']:
-                params += [
-                    layer.self_attn.q_proj.lora_A.default.weight,
-                    layer.self_attn.q_proj.lora_B.default.weight,
-                    layer.self_attn.v_proj.lora_A.default.weight,
-                    layer.self_attn.v_proj.lora_B.default.weight]
-            else:
-                params += layer.parameters()
+        for layer in self.model.model.layers:
+            params.extend([
+                layer.self_attn.q_proj.weight,
+                layer.self_attn.k_proj.weight,
+                layer.self_attn.v_proj.weight,
+                layer.self_attn.o_proj.weight,
+                layer.mlp.gate_proj.weight,
+                layer.mlp.up_proj.weight,
+                layer.mlp.down_proj.weight])
+        params.append(self.model.lm_head.weight)
         return params
 
 
