@@ -259,24 +259,21 @@ class KVCache:
 
     def visit(self, layer_idx, reverse=False):
 
-        from profiler import WallTime
+        if self.cpu_offload is not None:
+            factor = -1 if reverse else 1
+            cuda_layers = [
+                (layer_idx + self.num_layers + factor * i) % self.num_layers 
+                for i in range(self.cpu_offload)]
+            cpu_layers = filter(lambda x: x not in cuda_layers, range(self.num_layers))
 
-        with WallTime.get("visit"):
-            if self.cpu_offload is not None:
-                factor = -1 if reverse else 1
-                cuda_layers = [
-                    (layer_idx + self.num_layers + factor * i) % self.num_layers 
-                    for i in range(self.cpu_offload)]
-                cpu_layers = filter(lambda x: x not in cuda_layers, range(self.num_layers))
-
-                for lid in cpu_layers:
-                    stream = self.streams[self.stream_idx % len(self.streams)]
-                    self.cache[lid].move_to_cpu(stream)
-                    self.stream_idx += 1
-                for lid in cuda_layers:
-                    stream = self.streams[self.stream_idx % len(self.streams)]
-                    self.cache[lid].move_to_cuda(stream)
-                    self.stream_idx += 1
+            for lid in cpu_layers:
+                stream = self.streams[self.stream_idx % len(self.streams)]
+                self.cache[lid].move_to_cpu(stream)
+                self.stream_idx += 1
+            for lid in cuda_layers:
+                stream = self.streams[self.stream_idx % len(self.streams)]
+                self.cache[lid].move_to_cuda(stream)
+                self.stream_idx += 1
 
     @property
     def device(self):

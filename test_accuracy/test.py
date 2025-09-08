@@ -8,8 +8,7 @@ from corpus import get_processor, LazyRandomSampleCorpus
 from chunkoptim.utils import (
     get_model_and_tokenizer, 
     get_env_conf, 
-    chunkize,
-    History)
+    chunkize)
 from functools import partial
 from pathlib import Path
 from chunkoptim.cache.kv_cache import KVCache
@@ -74,13 +73,11 @@ def backend_cleanup():
     dist.destroy_process_group()
 
 
-def launch_test(args, pipeline):
+def launch_test(args, pipeline, method):
     backend_setup()
     
     env_conf = args.env_conf
     env_conf['model']['device_map'] = {"": dist.get_rank()}
-    args.context = eval(args.context)
-
 
     # load model
     seed_everything(0)
@@ -101,6 +98,7 @@ def launch_test(args, pipeline):
     loader = DataLoader(
         corpus, 
         batch_size=1, 
+        shuffle=False,
         collate_fn=collate_fn)
 
     base_memory_allocated = torch.cuda.max_memory_allocated()
@@ -108,29 +106,19 @@ def launch_test(args, pipeline):
     
     batch = next(iter(loader))
 
-    for context in args.context:
+    while batch['input_ids'].shape[-1] < args.context:
+        batch['input_ids'] = torch.cat([batch['input_ids'], batch['input_ids']], dim=-1)
+        batch['labels'] = torch.cat([batch['labels'], batch['labels']], dim=-1)
+    batch['input_ids'] = batch['input_ids'][..., :args.context]
+    batch['labels'] = batch['labels'][..., :args.context]
+    batch['seq_len'] = args.context
 
-        while batch['input_ids'].shape[-1] < context:
-            batch['input_ids'] = torch.cat([batch['input_ids'], batch['input_ids']], dim=-1)
-            batch['labels'] = torch.cat([batch['labels'], batch['labels']], dim=-1)
-        batch['input_ids'] = batch['input_ids'][..., :context]
-        batch['labels'] = batch['labels'][..., :context]
-        batch['seq_len'] = context
-
-        history = History(1_000_000)
-
-        for _ in range(3 if context is args.context[0] else 1):
-            
-            history.init()
-
-            pipeline(
-                model=model,
-                batch=batch)
-
-            history.step(0, batch['seq_len'])
-
-        mean_time, mean_memory = history.summary(False)
-        template = colorize("yellow", f"{context:<5d}\t|") + "{mean_time:<3.3f}\t| {mean_memory:.3f}"
+    pipeline(
+        model=model,
+        batch=batch)
+    
+    grad = [x.grad.data.cpu() for x in model.parameters()]
+    torch.save(grad, f"test_accuracy/{method}.pth")
 
     backend_cleanup()
 
@@ -168,6 +156,8 @@ def baseline(model, batch, grad_ckpt, page_size):
         grad_ckpt=grad_ckpt).sum() / batch['seq_len']
     loss.backward()
 
+    print(colorize('green', f'baseline-loss: {loss.item()}'), flush=True)
+
 
 def blockwise(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
     my_chunkize = partial(chunkize, dim=-1, chunk_size=block_size)
@@ -180,6 +170,8 @@ def blockwise(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
         page_size=page_size,
         num_heads=model.model.config.num_key_value_heads,
         cpu_offload=cpu_offload)
+    
+    accum_loss = 0
 
     with torch.no_grad():
         for chunk_input, chunk_target in zip(input_ids, labels):
@@ -189,7 +181,8 @@ def blockwise(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
                 labels=chunk_target,
                 kv_cache=kv_cache,
                 grad_ckpt=False)
-            model(**inputs)
+
+            accum_loss += model(**inputs).sum().item() / batch['seq_len']
 
     for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
         # forward prop
@@ -205,114 +198,12 @@ def blockwise(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
         loss.backward()
         kv_cache.post_process()
 
-
-def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_size, cpu_offload, page_budget):
-    my_chunkize = partial(chunkize, dim=-1, chunk_size=block_size)
-    input_ids = list(my_chunkize(batch['input_ids']))
-    labels = list(my_chunkize(batch['labels']))
-
-    from chunkoptim.cache.topk_cache import SparseKVCache
-
-    world_size = dist.get_world_size()
-
-    if dist.get_rank() == 0:
-        kv_cache = SparseKVCache(
-            num_layers=model.model.config.num_hidden_layers,
-            batch_size=1,
-            page_size=page_size,
-            num_heads=model.model.config.num_key_value_heads// world_size,
-            cpu_offload=cpu_offload,
-            page_budget=page_budget)
-    dist.barrier()
-    if dist.get_rank() != 0:
-        kv_cache = SparseKVCache(
-            num_layers=model.model.config.num_hidden_layers,
-            batch_size=1,
-            page_size=page_size,
-            num_heads=model.model.config.num_key_value_heads // world_size,
-            cpu_offload=cpu_offload,
-            page_budget=page_budget)
-    dist.barrier()
-
-    with torch.no_grad():
-        for chunk_input, chunk_target in zip(input_ids, labels):
-
-            # forward pass
-            inputs = dict(
-                input_ids=chunk_input,
-                labels=chunk_target,
-                kv_cache=kv_cache,
-                grad_ckpt=False)
-            model(**inputs)
-
-    for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
-
-        # forward prop
-        inputs = dict(
-            input_ids=chunk_input,
-            labels=chunk_target,
-            kv_cache=kv_cache,
-            grad_ckpt=grad_ckpt)
-        loss = model(**inputs).sum() / batch['seq_len']
-
-        # backward prop
-        kv_cache.pre_process()
-        loss.backward()
-        kv_cache.post_process()
-
-
-def blockwise_tensor_parallel(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
-    my_chunkize = partial(chunkize, dim=-1, chunk_size=block_size)
-    input_ids = list(my_chunkize(batch['input_ids']))
-    labels = list(my_chunkize(batch['labels']))
-
-    if dist.get_rank() == 0:
-        kv_cache = KVCache(
-            num_layers=model.model.config.num_hidden_layers,
-            batch_size=1,
-            page_size=page_size,
-            num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
-            cpu_offload=cpu_offload)
-    dist.barrier()
-    if dist.get_rank() != 0:
-        kv_cache = KVCache(
-            num_layers=model.model.config.num_hidden_layers,
-            batch_size=1,
-            page_size=page_size,
-            num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
-            cpu_offload=cpu_offload)
-    dist.barrier()
-
-    with torch.no_grad():
-        for chunk_input, chunk_target in zip(input_ids, labels):
-
-            # forward pass
-            inputs = dict(
-                input_ids=chunk_input,
-                labels=chunk_target,
-                kv_cache=kv_cache,
-                grad_ckpt=False)
-            model(**inputs)
-
-    for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
-
-        # forward prop
-        inputs = dict(
-            input_ids=chunk_input,
-            labels=chunk_target,
-            kv_cache=kv_cache,
-            grad_ckpt=grad_ckpt)
-        loss = model(**inputs).sum() / batch['seq_len']
-
-        # backward prop
-        kv_cache.pre_process()
-        loss.backward()
-        kv_cache.post_process()
+    print(colorize('green', f'blockwise-loss: {accum_loss}'), flush=True)
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--context", type=str, default="[10240 * (i + 1) for i in range(10)]")
+    parser.add_argument("--context", type=int, default=16384)
     parser.add_argument("--config", type=str, required=True)
     args = parser.parse_args()
 
@@ -330,11 +221,5 @@ if __name__ == '__main__':
     elif method == 'blockwise':
         pipe = blockwise
 
-    elif method == 'blockwise-tp':
-        pipe = blockwise_tensor_parallel
-
-    elif method == 'blockwise-tp-sparse':
-        pipe = blockwise_tensor_parallel_sparse
-
     pipe = partial(pipe, **kwargs)
-    launch_test(args, pipe)
+    launch_test(args, pipe, method)

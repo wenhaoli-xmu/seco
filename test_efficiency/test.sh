@@ -8,5 +8,5 @@ torchrun \
     --nnodes 1 \
     --nproc_per_node 1 \
     test_efficiency/test.py \
-    --context "[16384]" \
-    --config test_efficiency/config_blockwise_offload.json
+    --context "[8192, 16384, 32768, 65536, 131072, 262144]" \
+    --config test_efficiency/config_baseline.json

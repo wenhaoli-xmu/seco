@@ -9,7 +9,7 @@ from flash_attn import flash_attn_func
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
 from ..cache.kv_cache import CacheManager, KVCache
-from ..ops.flash_paged_attn import flash_paged_attn_func
+from ..ops import flash_attn_func
 
 
 def model_forward(self, input_ids, kv_cache, grad_ckpt, **kwargs):
@@ -110,11 +110,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
     cos, sin = self.rotary_emb(keys, pos)
     ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
 
-    # manager = kv_cache[self.layer_idx]
-    # manager.update(keys, vals)
-
-    attn_output = flash_attn_func(ques, keys, vals, causal=True)
-    # attn_output = flash_paged_attn_func(ques, keys, vals, manager)
+    attn_output = flsah_attn_func(ques, keys, vals)
 
     attn_output = attn_output.flatten(2)
     attn_output = self.o_proj(attn_output)

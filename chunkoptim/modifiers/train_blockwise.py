@@ -103,7 +103,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
     vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
 
     # past length
-    past_length = kv_cache.length(self.layer_idx)
+    past_length = kv_cache[self.layer_idx].num_kv
     if torch.is_grad_enabled():
         # NOTE: stage-2: second forward prop
         past_length -= ques.shape[1]
