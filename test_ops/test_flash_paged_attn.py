@@ -1,11 +1,11 @@
 import torch
 from chunkoptim.ops import flash_paged_attn_func
-from chunkoptim.cache.kv_cache import CacheManager
+from chunkoptim.cache.kv_cache import CacheManagerSimple
 from flash_attn import flash_attn_func
 
 
 if __name__ == '__main__':
-    page_size = 64
+    page_size = 128
     num_heads = 32
     num_kv_heads = 4
 
@@ -14,7 +14,7 @@ if __name__ == '__main__':
 
     k_cache = torch.randn((1, num_kv_cache, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
     v_cache = torch.randn((1, num_kv_cache, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)
-    manager = CacheManager(1, page_size, num_kv_heads, 128)
+    manager = CacheManagerSimple(1, page_size, num_kv_heads, 128)
 
     q = torch.randn((1, num_new_toks, num_heads, 128), device='cuda', dtype=torch.bfloat16)
     k = torch.randn((1, num_new_toks, num_kv_heads, 128), device='cuda', dtype=torch.bfloat16)

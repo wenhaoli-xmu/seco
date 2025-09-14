@@ -53,3 +53,7 @@ def check_and_apply_qk_rope(query, key, cos, sin):
     Q = apply_rotary_pos_emb(query, cos, sin, unsqueeze_dim=2)
     K = apply_rotary_pos_emb(key, cos, sin, unsqueeze_dim=2)
     return Q, K
+
+
+def apply_rope(x, cos, sin):
+    return apply_rotary_pos_emb(x, cos, sin, unsqueeze_dim=2)

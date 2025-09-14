@@ -6,8 +6,8 @@ import triton.language as tl
 
 from .utils import IS_BF16_ATOM_ADD_SUPPORTED
 
-BLOCK_M = 64
-BLOCK_N = 64
+BLOCK_M = 128
+BLOCK_N = 128
 
 @triton.jit
 def _bwd_preprocess_do_o_dot(
@@ -253,7 +253,7 @@ def _flash_attn_forward(
     global BLOCK_M, BLOCK_N
 
     batch, seqlen_q, nheads, d = q.shape
-    seqlen_k, num_kv_heads, kv_head_dim = k.shape[1]
+    seqlen_k, num_kv_heads, kv_head_dim = k.shape[1:]
     
     assert d <= 128
     assert q.dtype in [torch.float16, torch.bfloat16]
@@ -308,7 +308,7 @@ def _flash_attn_backward(
     global BLOCK_M, BLOCK_N
 
     batch, seqlen_q, nheads, d = q.shape
-    seqlen_k, num_kv_heads, kv_head_dim = k.shape[1]
+    seqlen_k, num_kv_heads, kv_head_dim = k.shape[1:]
     seqlen_q_rounded = math.ceil(seqlen_q / BLOCK_M) * BLOCK_M
     
     delta = torch.empty_like(lse)
@@ -370,12 +370,21 @@ class FlashAttention(torch.autograd.Function):
         q, k, v, o, lse = ctx.saved_tensors
 
         dq = torch.zeros_like(q)
-        dk = torch.zeros_like(k)
-        dv = torch.zeros_like(v)
+
+        if IS_BF16_ATOM_ADD_SUPPORTED:
+            dk = torch.zeros_like(k)
+            dv = torch.zeros_like(v)
+        else:
+            dk = torch.zeros_like(k, dtype=torch.float32)
+            dv = torch.zeros_like(v, dtype=torch.float32)
 
         _flash_attn_backward(
             o, do, q, k, v, dq, dk, dv, lse,
             ctx.softmax_scale)
+        
+        if not IS_BF16_ATOM_ADD_SUPPORTED:
+            dk = dk.bfloat16()
+            dv = dv.bfloat16()
 
         return dq, dk, dv, None, None, None
 

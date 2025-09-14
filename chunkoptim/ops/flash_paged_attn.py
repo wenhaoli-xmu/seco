@@ -107,14 +107,18 @@ def _fwd_kernel(
         q = tl.load(q_ptrs, mask=offs_m[:, None] < seqlen_q, other=0.0)
 
     q_idx = q_start_idx + offs_m
+    start_m_block += 1
 
-    for kv_block_idx in tl.range(0, tl.cdiv(q_start_idx, BLOCK_N) + start_m_block + 1):
+    for kv_block_idx in tl.range(0, tl.cdiv(q_start_idx, BLOCK_N) + start_m_block):
 
         k_idx = kv_block_idx * BLOCK_N + tl.arange(0, BLOCK_N)
         kv_mask = k_idx[:, None] < seqlen_k
 
-        k_page_ptr = tl.cast(tl.load(T + kv_block_idx * 4), tl.pointer_type(tl.bfloat16))
-        v_page_ptr = tl.cast(tl.load(T + kv_block_idx * 4 + 1), tl.pointer_type(tl.bfloat16))
+        k_page_ptr = tl.load(T)
+        v_page_ptr = tl.load(T + 1)
+
+        k_page_ptr = tl.cast(k_page_ptr, tl.pointer_type(tl.bfloat16))
+        v_page_ptr = tl.cast(v_page_ptr, tl.pointer_type(tl.bfloat16))
 
         k = tl.load(k_page_ptr + kv_offs, mask=kv_mask)
         v = tl.load(v_page_ptr + kv_offs, mask=kv_mask)
@@ -136,6 +140,8 @@ def _fwd_kernel(
         m_i = m_ij
         l_i_new = tl.exp(lse_i - m_ij) + l_ij
         lse_i = m_ij + tl.log(l_i_new)
+
+        T += 4
 
     o_scale = tl.exp(m_i - lse_i)
     acc_o = acc_o * o_scale[:, None]
@@ -201,21 +207,27 @@ def _bwd_kernel(
     dq_block = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
 
     q_idx = q_start_idx + offs_m
+    start_m_block += 1
 
-    for kv_block_idx in range(0, tl.cdiv(q_start_idx, BLOCK_N) + start_m_block + 1):
+    for kv_block_idx in range(0, tl.cdiv(q_start_idx, BLOCK_N) + start_m_block):
         
         k_idx = kv_block_idx * BLOCK_N + tl.arange(0, BLOCK_N)
         kv_mask = k_idx[:, None] < seqlen_k
 
-        k_page_ptr = tl.cast(tl.load(T + kv_block_idx * 4), tl.pointer_type(tl.bfloat16))
-        v_page_ptr = tl.cast(tl.load(T + kv_block_idx * 4 + 1), tl.pointer_type(tl.bfloat16))
+        k_page_ptr = tl.load(T)
+        v_page_ptr = tl.load(T + 1)
+        dk_page_ptr = tl.load(T + 2)
+        dv_page_ptr = tl.load(T + 3)
+
+        k_page_ptr = tl.cast(k_page_ptr, tl.pointer_type(tl.bfloat16))
+        v_page_ptr = tl.cast(v_page_ptr, tl.pointer_type(tl.bfloat16))
 
         if FP32_ATOMIC_ADD:
-            dk_page_ptr = tl.cast(tl.load(T + kv_block_idx * 4 + 2), tl.pointer_type(tl.float32))
-            dv_page_ptr = tl.cast(tl.load(T + kv_block_idx * 4 + 3), tl.pointer_type(tl.float32))
+            dk_page_ptr = tl.cast(dk_page_ptr, tl.pointer_type(tl.float32))
+            dv_page_ptr = tl.cast(dv_page_ptr, tl.pointer_type(tl.float32))
         else:
-            dk_page_ptr = tl.cast(tl.load(T + kv_block_idx * 4 + 2), tl.pointer_type(tl.bfloat16))
-            dv_page_ptr = tl.cast(tl.load(T + kv_block_idx * 4 + 3), tl.pointer_type(tl.bfloat16))
+            dk_page_ptr = tl.cast(dk_page_ptr, tl.pointer_type(tl.bfloat16))
+            dv_page_ptr = tl.cast(dv_page_ptr, tl.pointer_type(tl.bfloat16))
         
         k = tl.load(k_page_ptr + kv_offs, mask=kv_mask)
         v = tl.load(v_page_ptr + kv_offs, mask=kv_mask)
@@ -237,6 +249,8 @@ def _bwd_kernel(
         tl.atomic_add(dk_page_ptr + kv_offs, dk_block, mask=kv_mask, sem='relaxed')
 
         dq_block += tl.dot(ds, k)
+
+        T += 4
 
     if EVEN_M:
         tl.store(dq_ptrs, dq_block)

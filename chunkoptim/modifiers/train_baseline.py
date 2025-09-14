@@ -3,8 +3,6 @@ import types
 import torch.distributed
 from ..modifier import Modifier
 from .utils import check_and_apply_qk_rope, do_projection, generate_mask
-from peft import LoraConfig, get_peft_model, TaskType
-from flash_attn import flash_attn_func
 
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
@@ -110,7 +108,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
     cos, sin = self.rotary_emb(keys, pos)
     ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
 
-    attn_output = flsah_attn_func(ques, keys, vals)
+    attn_output = flash_attn_func(ques, keys, vals)
 
     attn_output = attn_output.flatten(2)
     attn_output = self.o_proj(attn_output)

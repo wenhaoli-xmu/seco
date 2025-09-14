@@ -3,8 +3,7 @@ import types
 import torch.nn as nn
 import torch.distributed as dist
 from ..modifier import Modifier
-from .utils import check_and_apply_qk_rope
-from peft import LoraConfig, get_peft_model, TaskType
+from .utils import do_projection, apply_rope
 import torch.nn.functional as F
 from ..ops.flash_paged_topk import flash_paged_sparse_attn_func
 from ..ops.all_gather import all_gather_uneven
@@ -134,38 +133,57 @@ def layer_forward(self, hidden_states, kv_cache):
 
 def self_attn_forward(self, hidden_states, kv_cache):
     world_size = get_tensor_parallel_world_size()
-    
+
+    # =========================================
+    stage = 2 if torch.is_grad_enabled() else 1
+    kv_cache.visit(self.layer_idx)
+    # =========================================
+
     num_heads = self.config.num_attention_heads // world_size
     num_kv_heads = self.config.num_key_value_heads // world_size
     embed_dim = self.config.hidden_size
     head_dim = embed_dim // self.config.num_attention_heads
-    
-    ques = self.q_proj(hidden_states)
-    keys = self.k_proj(hidden_states)
-    vals = self.v_proj(hidden_states)
 
-    ques = ques.view(ques.shape[0], ques.shape[1], num_heads, head_dim)
-    keys = keys.view(keys.shape[0], keys.shape[1], num_kv_heads, head_dim)
-    vals = vals.view(vals.shape[0], vals.shape[1], num_kv_heads, head_dim)
+    # ===========================================
+    past_length = kv_cache[self.layer_idx].num_kv
+    if stage == 2:
+        past_length -= hidden_states.shape[1]
+    # ===========================================
+        
+    # position embedding
+    pos = torch.arange(past_length, past_length + hidden_states.shape[1])
+    pos = pos[None, :].to(hidden_states.device)
+    cos, sin = self.rotary_emb(hidden_states, pos)
 
-    past_length = kv_cache.length(self.layer_idx)
-    if torch.is_grad_enabled():
-        past_length -= ques.shape[1]
+    # query & key & value projection
+    ques = do_projection(self.q_proj, hidden_states, num_heads, head_dim, head_first=False)
+    ques = apply_rope(ques, cos, sin)
 
-    pos = torch.arange(past_length, past_length + keys.shape[1], device=keys.device).unsqueeze(0)
-    cos, sin = self.rotary_emb(vals, pos)
-    ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
+    # ==========================================
+    kv_cache[self.layer_idx].select(ques, stage)
+    # ==========================================
 
-    manager = kv_cache[self.layer_idx]
-    if not torch.is_grad_enabled():
-        manager.update(keys, vals)
+    keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
+    vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
+    keys = apply_rope(keys, cos, sin)
 
-    attn_output = flash_paged_sparse_attn_func(ques, keys, vals, manager)
+    # ================================================
+    kv_cache[self.layer_idx].update(keys, vals, stage)
+    kv_cache[self.layer_idx].layer_idx = self.layer_idx
+    kv_cache[self.layer_idx].kv_cache = kv_cache
+    # ================================================
+
+    attn_output = flash_paged_sparse_attn_func(
+        ques,
+        keys,
+        vals,
+        kv_cache[self.layer_idx])
+
     attn_output = attn_output.flatten(2)
-    
     attn_output = self.o_proj(attn_output)
 
     return attn_output
+
 
 def mlp_forward(self, hidden_state):
     gate_output = self.gate_proj(hidden_state)
@@ -173,6 +191,7 @@ def mlp_forward(self, hidden_state):
     intermediate = self.act_fn(gate_output) * up_output
     
     return self.down_proj(intermediate)
+
 
 class ModelForTraining(Modifier):
     def __init__(self, model, save_ckp: str, load_ckp: str, config: str):
@@ -214,7 +233,7 @@ class ModelForTraining(Modifier):
             layer.mlp.up_proj = ColumnParallelLinear(layer.mlp.up_proj)
             layer.mlp.down_proj = RowParallelLinear(layer.mlp.down_proj)
 
-        # 这个地方有修改
+        # NOTE: modified
         # model.lm_head = ColumnParallelLinearUneven(model.lm_head)
 
     def _init_lora(self, model, lora_rank, lora_alpha, lora_dropout):
@@ -331,7 +350,7 @@ class ModelForTraining(Modifier):
             kv_cache=kv_cache, 
             grad_ckpt=grad_ckpt)
         
-        # NOTE: 这个地方有修改
+        # NOTE: modified
         # logits = all_gather_uneven(logits)
 
         if labels is not None:

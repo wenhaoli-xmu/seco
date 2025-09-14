@@ -3,7 +3,7 @@ import types
 import torch.distributed
 from ..modifier import Modifier
 from .utils import check_and_apply_qk_rope, do_projection, generate_mask
-from peft import LoraConfig, get_peft_model, TaskType
+
 import torch.nn.functional as F
 from ..ops.flash_paged_attn import flash_paged_attn_func
 from torch.utils.checkpoint import checkpoint
@@ -103,7 +103,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
     vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
 
     # past length
-    past_length = kv_cache[self.layer_idx].num_kv
+    past_length = kv_cache.length(self.layer_idx)
     if torch.is_grad_enabled():
         # NOTE: stage-2: second forward prop
         past_length -= ques.shape[1]

@@ -206,7 +206,7 @@ def blockwise(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
         kv_cache.post_process()
 
 
-def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_size, cpu_offload, page_budget):
+def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_size, cpu_offload, page_budget, visualize):
     my_chunkize = partial(chunkize, dim=-1, chunk_size=block_size)
     input_ids = list(my_chunkize(batch['input_ids']))
     labels = list(my_chunkize(batch['labels']))
@@ -244,6 +244,58 @@ def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_s
                 kv_cache=kv_cache,
                 grad_ckpt=False)
             model(**inputs)
+
+    if visualize is not None:
+        import os
+        import math
+        import matplotlib.pyplot as plt
+        from matplotlib.colors import LinearSegmentedColormap
+
+        num_pages = int(math.ceil(batch['input_ids'].shape[-1] / page_size))
+        mask = torch.zeros((num_pages, num_pages), dtype=torch.bool)
+        num_pages_per_chunk = block_size // page_size
+        manager = kv_cache.managers[visualize]
+
+        for chunk_idx, (pages, table) in enumerate(zip(manager.last_update_pages, manager.idx)):
+            start = num_pages_per_chunk * chunk_idx
+            end = start + pages
+            if table is None:
+                mask[start: end, :] = True
+            else:
+                table = table[0]
+                for query_page_idx, table_per_query in enumerate(table):
+                    for page_idx in table_per_query:
+                        if (start + query_page_idx) < num_pages and page_idx < num_pages:
+                            mask[start + query_page_idx, page_idx] = True
+            
+            valid_start = start
+            valid_end = min(end, num_pages)
+            if valid_start < valid_end:
+                mask[valid_start: valid_end, valid_start: valid_end] = True
+
+        rng = torch.arange(num_pages)
+        causal_mask = rng[:, None] >= rng[None, :]
+        mask = mask & causal_mask
+
+        os.makedirs("visualize", exist_ok=True)
+        file_name = f"visualize/ctx{batch['input_ids'].shape[-1]}-pgs{page_size}-cks{block_size}-bgt{page_budget}-lyr{visualize}.jpg"
+
+        dark_red = [x / 255 for x in [21, 56, 89]]
+        light_red_almost_white = [x / 255 for x in [254, 245, 220]]
+
+        cmap_colors = [
+            (0.0, light_red_almost_white),
+            (1.0, dark_red)
+        ]
+        custom_cmap = LinearSegmentedColormap.from_list("custom_red_cmap", cmap_colors)
+
+        plt.figure(figsize=(10, 10))
+        plt.imshow(mask, cmap=custom_cmap, vmin=0, vmax=1)
+        
+        plt.axis('off') 
+        
+        plt.savefig(file_name, dpi=640, bbox_inches='tight', pad_inches=0)
+        plt.close()
 
     for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
 
