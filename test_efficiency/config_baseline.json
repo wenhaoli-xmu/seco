@@ -1,5 +1,4 @@
 {
-    "method": "baseline", 
-    "grad_ckpt": true, 
-    "page_size": 128
+    "method": "baseline-tp", 
+    "grad_ckpt": true
 }

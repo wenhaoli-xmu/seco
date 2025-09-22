@@ -441,6 +441,7 @@ def _flash_sparse_attn_backward(
     stride_kvh = kv_head_dim
 
     grid_bwd = (triton.cdiv(seqlen_q, BLOCK_M), batch * nheads)
+
     _bwd_kernel[grid_bwd](
         q, do, dq, page_table, select_table,
         lse, delta,

@@ -93,6 +93,11 @@ def float64_attention(q, k, v, causal=False):
 
 def self_attn_forward(self, hidden_states, kv_cache):
 
+    # =========================================
+    stage = 2 if torch.is_grad_enabled() else 1
+    kv_cache.visit(self.layer_idx)
+    # =========================================
+
     num_heads, embed_dim = self.config.num_attention_heads, self.config.hidden_size
     num_kv_heads = self.config.num_key_value_heads
     head_dim = embed_dim // num_heads
@@ -102,31 +107,27 @@ def self_attn_forward(self, hidden_states, kv_cache):
     keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
     vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
 
-    # past length
-    past_length = kv_cache.length(self.layer_idx)
-    if torch.is_grad_enabled():
-        # NOTE: stage-2: second forward prop
+    # ===========================================
+    past_length = kv_cache[self.layer_idx].num_kv
+    if stage == 2:
         past_length -= ques.shape[1]
+    # ===========================================
 
     # position embedding
     pos = torch.arange(past_length, past_length + keys.shape[1])
     pos = pos[None, :].to(keys.device)
     cos, sin = self.rotary_emb(keys, pos)
-
     ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
 
-    # GQA
-    manager = kv_cache[self.layer_idx]
-
-    if not torch.is_grad_enabled():
-        # NOTE: stage-1: first forward prop
-        manager.update(keys, vals)
+    # ================================================
+    kv_cache[self.layer_idx].update(keys, vals, stage)
+    # ================================================
 
     attn_output = flash_paged_attn_func(
         ques,
         keys,
         vals,
-        manager)
+        kv_cache[self.layer_idx])
 
     attn_output = attn_output.flatten(2)
     attn_output = self.o_proj(attn_output)

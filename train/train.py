@@ -1,4 +1,4 @@
-from torch.utils.data import ConcatDataset, DataLoader
+from torch.utils.data import ConcatDataset, DataLoader, Dataset
 import torch.distributed as dist
 
 import torch
@@ -6,14 +6,38 @@ import json
 
 from corpus import get_processor, LazyRandomSampleCorpus
 from chunkoptim.utils import (
+    get_optimizer_and_lr_adjuster,
     get_model_and_tokenizer, 
     get_env_conf, 
     chunkize,
     History)
 from functools import partial
 from pathlib import Path
+from chunkoptim.cache.kv_cache import KVCache
 import argparse, random, numpy, os
 from pygments.console import colorize
+
+
+class PackedTokenDataset(Dataset):
+    def __init__(self, file_path: str):
+        super().__init__()
+        self.data = torch.load(file_path)            
+        self.num_chunks, self.chunk_size = self.data.shape
+        print(f"✅ data loaded")
+        print(f"  - each dataset contains {self.num_chunks} data blocks.")
+        print(f"  - each block consists of {self.chunk_size} tokens.")
+
+    def __len__(self):
+        return self.num_chunks
+
+    def __getitem__(self, idx: int):
+        chunk = self.data[idx].tolist()
+        input_ids = chunk[:-1]
+        labels = chunk[1:]
+        
+        return {
+            "input_ids": input_ids,
+            "labels": labels}
 
 
 def zero_grad(params):
@@ -30,8 +54,7 @@ def build_dataset(env_conf, tokenizer):
         sum_partition += info['partition']
         num_instance = int(info['partition'] * num_iters)
 
-        proc = get_processor(info['conf'], tokenizer)
-        corp = LazyRandomSampleCorpus(info['data'], proc, max_instance=num_instance, use_cache=False)
+        corp = PackedTokenDataset(info['data'])
         corpus.append(corp)
 
     assert sum_partition == 1
@@ -73,30 +96,24 @@ def backend_cleanup():
     dist.destroy_process_group()
 
 
-def launch_test(args, pipeline):
+def launch_train(args, pipeline):
     backend_setup()
     
     env_conf = args.env_conf
     env_conf['model']['device_map'] = {"": dist.get_rank()}
-    args.context = eval(args.context)
-
+    train_iters = env_conf['train']["train_iters"]
 
     # load model
     seed_everything(0)
     model, tokenizer = get_model_and_tokenizer(**env_conf['model'])
     model.train()
 
-    """
-    NOTE: Rank0 dataset loading is ahead of other ranks. This is because data buffer is saved after rank0 finishes,
-    thus others can utilize this buffer to avoid redundant processing and ensure consistency across ranks.
-    """
-    if dist.get_rank() == 0:
-        corpus = build_dataset(env_conf, tokenizer)
-    dist.barrier()
-    if dist.get_rank() != 0:
-        corpus = build_dataset(env_conf, tokenizer)
-    dist.barrier()
+    # load optimizer and lr adjuster
+    params = model.ft_params()
+    optimizer, lr_adjuster = get_optimizer_and_lr_adjuster(**env_conf['train'], params=params)
 
+    # build dataset
+    corpus = build_dataset(env_conf, tokenizer)
     loader = DataLoader(
         corpus, 
         batch_size=1, 
@@ -104,52 +121,28 @@ def launch_test(args, pipeline):
 
     base_memory_allocated = torch.cuda.max_memory_allocated()
     print(colorize("yellow", "Base GPU memory allocated:") + colorize("green", f"{base_memory_allocated // 1024 ** 2} MB"))
-    
-    batch = next(iter(loader))
+    history = History(1)
 
-    for context in args.context:
+    for step, batch in enumerate(loader):
+        lr_adjuster(step=step)
 
-        while batch['input_ids'].shape[-1] < context:
-            batch['input_ids'] = torch.cat([batch['input_ids'], batch['input_ids']], dim=-1)
-            batch['labels'] = torch.cat([batch['labels'], batch['labels']], dim=-1)
-        batch['input_ids'] = batch['input_ids'][..., :context]
-        batch['labels'] = batch['labels'][..., :context]
-        batch['seq_len'] = context
+        history.init()
 
-        history = History(1_000_000)
+        loss = pipeline(
+            model=model,
+            batch=batch)
+        history.step(loss, batch['seq_len'])
 
-        for _ in range(2 if context < 65536 else 1):
-            
-            history.init()
+        if (step + 1) % args.accum_grad == 0:
+            optimizer.step()
+            zero_grad(params)
 
-            pipeline(
-                model=model,
-                batch=batch)
+        if (step + 1) >= train_iters:
+            break
 
-            history.step(0, batch['seq_len'])
-
-        mean_time, mean_memory = history.summary(False)
-        template = colorize("yellow", f"{context:<5d}\t|") + "{mean_time:<3.3f}\t| {mean_memory:.3f}"
-
+    output = json.dumps(history.loss)
+    print(output)
     backend_cleanup()
-
-
-def get_grad(params):
-    grads = []
-    for param in params:
-        if param.grad is not None and param.grad.data is not None:
-            grads.append(param.grad.data.ravel())
-        else:
-            grads.append(torch.zeros_like(param).ravel())
-    return torch.cat(grads, dim=0)
-
-
-def print_grad(params):
-    for param in params:
-        if param.grad is not None and param.grad.data is not None:
-            print(param.abs().sum().item())
-        else:
-            print("none")
 
 
 def baseline_tensor_parallel(model, batch, grad_ckpt):
@@ -159,9 +152,10 @@ def baseline_tensor_parallel(model, batch, grad_ckpt):
         kv_cache=None,
         grad_ckpt=grad_ckpt).sum() / batch['seq_len']
     loss.backward()
+    return loss.item()
 
 
-def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_size, cpu_offload, page_budget, visualize):
+def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_size, cpu_offload, page_budget):
     my_chunkize = partial(chunkize, dim=-1, chunk_size=block_size)
     input_ids = list(my_chunkize(batch['input_ids']))
     labels = list(my_chunkize(batch['labels']))
@@ -189,6 +183,8 @@ def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_s
             page_budget=page_budget)
     dist.barrier()
 
+    accum_loss = 0
+
     with torch.no_grad():
         for chunk_input, chunk_target in zip(input_ids, labels):
 
@@ -198,59 +194,7 @@ def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_s
                 labels=chunk_target,
                 kv_cache=kv_cache,
                 grad_ckpt=False)
-            model(**inputs)
-
-    if visualize is not None:
-        import os
-        import math
-        import matplotlib.pyplot as plt
-        from matplotlib.colors import LinearSegmentedColormap
-
-        num_pages = int(math.ceil(batch['input_ids'].shape[-1] / page_size))
-        mask = torch.zeros((num_pages, num_pages), dtype=torch.bool)
-        num_pages_per_chunk = block_size // page_size
-        manager = kv_cache.managers[visualize]
-
-        for chunk_idx, (pages, table) in enumerate(zip(manager.last_update_pages, manager.idx)):
-            start = num_pages_per_chunk * chunk_idx
-            end = start + pages
-            if table is None:
-                mask[start: end, :] = True
-            else:
-                table = table[0]
-                for query_page_idx, table_per_query in enumerate(table):
-                    for page_idx in table_per_query:
-                        if (start + query_page_idx) < num_pages and page_idx < num_pages:
-                            mask[start + query_page_idx, page_idx] = True
-            
-            valid_start = start
-            valid_end = min(end, num_pages)
-            if valid_start < valid_end:
-                mask[valid_start: valid_end, valid_start: valid_end] = True
-
-        rng = torch.arange(num_pages)
-        causal_mask = rng[:, None] >= rng[None, :]
-        mask = mask & causal_mask
-
-        os.makedirs("visualize", exist_ok=True)
-        file_name = f"visualize/ctx{batch['input_ids'].shape[-1]}-pgs{page_size}-cks{block_size}-bgt{page_budget}-lyr{visualize}.jpg"
-
-        dark_red = [x / 255 for x in [21, 56, 89]]
-        light_red_almost_white = [x / 255 for x in [254, 245, 220]]
-
-        cmap_colors = [
-            (0.0, light_red_almost_white),
-            (1.0, dark_red)
-        ]
-        custom_cmap = LinearSegmentedColormap.from_list("custom_red_cmap", cmap_colors)
-
-        plt.figure(figsize=(10, 10))
-        plt.imshow(mask, cmap=custom_cmap, vmin=0, vmax=1)
-        
-        plt.axis('off') 
-        
-        plt.savefig(file_name, dpi=640, bbox_inches='tight', pad_inches=0)
-        plt.close()
+            accum_loss += model(**inputs).sum().item() / batch['seq_len']
 
     for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
 
@@ -267,13 +211,13 @@ def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_s
         loss.backward()
         kv_cache.post_process()
 
+    return accum_loss
+
 
 def blockwise_tensor_parallel(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
     my_chunkize = partial(chunkize, dim=-1, chunk_size=block_size)
     input_ids = list(my_chunkize(batch['input_ids']))
     labels = list(my_chunkize(batch['labels']))
-
-    from chunkoptim.cache.kv_cache import KVCache
 
     if dist.get_rank() == 0:
         kv_cache = KVCache(
@@ -292,6 +236,8 @@ def blockwise_tensor_parallel(model, batch, grad_ckpt, block_size, page_size, cp
             cpu_offload=cpu_offload)
     dist.barrier()
 
+    accum_loss = 0
+
     with torch.no_grad():
         for chunk_input, chunk_target in zip(input_ids, labels):
 
@@ -301,7 +247,7 @@ def blockwise_tensor_parallel(model, batch, grad_ckpt, block_size, page_size, cp
                 labels=chunk_target,
                 kv_cache=kv_cache,
                 grad_ckpt=False)
-            model(**inputs)
+            accum_loss += model(**inputs).sum().item() / batch['seq_len']
 
     for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
 
@@ -318,11 +264,13 @@ def blockwise_tensor_parallel(model, batch, grad_ckpt, block_size, page_size, cp
         loss.backward()
         kv_cache.post_process()
 
+    return accum_loss
+
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
-    parser.add_argument("--context", type=str, default="[10240 * (i + 1) for i in range(10)]")
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--accum-grad", type=int, default=1)
     args = parser.parse_args()
 
     args.config = json.load(open(args.config, 'r'))
@@ -343,4 +291,4 @@ if __name__ == '__main__':
         pipe = blockwise_tensor_parallel_sparse
 
     pipe = partial(pipe, **kwargs)
-    launch_test(args, pipe)
+    launch_train(args, pipe)

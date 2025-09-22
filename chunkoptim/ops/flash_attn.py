@@ -207,7 +207,7 @@ def _bwd_kernel(
 
     q_idx = q_start_idx + offs_m
 
-    for kv_block_idx in range(0, tl.cdiv(q_start_idx, BLOCK_N) + start_m_block + 1):
+    for kv_block_idx in tl.range(0, tl.cdiv(q_start_idx, BLOCK_N) + start_m_block + 1):
         
         k_idx = kv_block_idx * BLOCK_N + tl.arange(0, BLOCK_N)
         kv_mask = k_idx[:, None] < seqlen_k
@@ -329,6 +329,7 @@ def _flash_attn_backward(
     num_warps = 4 if kv_head_dim <= 64 else 8
 
     grid_bwd = (triton.cdiv(seqlen_q, BLOCK_M), batch * nheads)
+
     _bwd_kernel[grid_bwd](
         q, k, v, do, dq, dk, dv,
         lse, delta,

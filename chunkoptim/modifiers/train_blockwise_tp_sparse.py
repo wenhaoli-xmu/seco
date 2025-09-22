@@ -136,7 +136,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
 
     # =========================================
     stage = 2 if torch.is_grad_enabled() else 1
-    kv_cache.visit(self.layer_idx)
+    kv_cache.visit(self.layer_idx, stage)
     # =========================================
 
     num_heads = self.config.num_attention_heads // world_size
@@ -169,8 +169,6 @@ def self_attn_forward(self, hidden_states, kv_cache):
 
     # ================================================
     kv_cache[self.layer_idx].update(keys, vals, stage)
-    kv_cache[self.layer_idx].layer_idx = self.layer_idx
-    kv_cache[self.layer_idx].kv_cache = kv_cache
     # ================================================
 
     attn_output = flash_paged_sparse_attn_func(
