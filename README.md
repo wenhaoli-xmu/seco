@@ -1,103 +1,117 @@
-# SeCO v2: 让LLM在单卡上训练4M上下文
+# OOMB
 
 ## Overview
 
-* 在SeCO v1的基础上，加入了大量的优化技术，包括：
-    * paged kv cache & its gradients 管理，提高内存scale表现
-    * 独立于torch autograd system的kv cache管理，更加高效
-    * 支持cpu offload
+OOMB incorporates numerous optimization techniques, including:
 
-* 支持tensor parallel
-    * 源代码在`chunkoptim/modifiers`文件夹下
-    * 能够将单卡内存减少接近一半
-    * 训练时间随着并行卡数增多近线性减少
+  * **Paged KV Cache & Gradient Management:** Improves memory scaling performance.
+  * **Independent KV Cache Management:** A more efficient system that operates independently of the Torch autograd engine.
+  * **CPU Offloading:** Full support for offloading to CPU memory.
 
-* 支持topk sparse attention
-    * 允许训练时间随着context length **近线性增长**
-    * 在sparse attention模式下，cpu offload的通信量不随着上下文增长而增长
+**Tensor Parallelism (TP) Support**
 
-## 快速入门
+  * Source code is available in the `chunkoptim/modifiers` directory.
+  * Reduces single-GPU memory usage by nearly 50%.
+  * Training time decreases almost linearly as the number of parallel GPUs increases.
 
-1. 创建`KVCache`或者`SparseKVCache`对象
+**Top-K Sparse Attention Support**
 
-    * `SparseKVCache`比`KVCache`多一个参数`page_budget`，表示attention计算采用的topk的page数
-    * `cpu_offload`参数可选 `2` 或者 `None`，分别表示启动offload或者关闭
-    * 要尽量在gpu:0加载kernel，这样其他gpu中的进程可以在gpu0加载好之后直接从缓存调用，从而避免一起加载导致的冲突
-    * 支持batch size > 1，但是在超长文本中 >1 的batch size没有什么实际意义
+  * Allows training time to grow **nearly linearly** with context length.
+  * In sparse attention mode, the communication overhead from CPU offloading does not increase with context length.
 
-    ```python
-    from chunkoptim.cache.kv_cache import KVCache
-    from chunkoptim.cache.topk_cache import SparseKVCache
+## Quick Start
 
-    if dist.get_rank() == 0:
-        if dist.get_rank() == 0:
-            kv_cache = KVCache(
-                num_layers=model.model.config.num_hidden_layers,
-                batch_size=1,
-                page_size=page_size,
-                num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
-                cpu_offload=cpu_offload)
-        dist.barrier()
-        if dist.get_rank() != 0:
-            kv_cache = KVCache(
-                num_layers=model.model.config.num_hidden_layers,
-                batch_size=1,
-                page_size=page_size,
-                num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
-                cpu_offload=cpu_offload)
-        dist.barrier()
-    ```
+### 1\. Create a `KVCache` or `SparseKVCache` object
 
-2. 将输入切分成块
+  * `SparseKVCache` includes an additional `page_budget` parameter, which specifies the number of pages for the Top-K attention computation.
+  * The `cpu_offload` parameter can be set to `2` (enabled) or `None` (disabled).
+  * It is recommended to load the kernel on `gpu:0` first. This allows processes on other GPUs to load it directly from the cache, avoiding concurrent loading conflicts.
+  * While a `batch_size` \> 1 is supported, it offers little practical benefit for extremely long sequences.
 
-    * 可以直接使用我们在utils中提供了便捷的切分工具
-    * 这里的4096就是最终处理上下文的单位，对于内存更大的GPU，可以尽量调高此值，从而减少回合数
+<!-- end list -->
 
-    ```python
-    from chunkoptim.utils import chunkize
-    from functools import partial
+```python
+from chunkoptim.cache.kv_cache import KVCache
+from chunkoptim.cache.topk_cache import SparseKVCache
+import torch.distributed as dist
 
-    my_chunkize = partial(chunkize, dim=-1, chunk_size=4096)
+# It's recommended to initialize on rank 0 first to prevent race conditions
+if dist.get_rank() == 0:
+    kv_cache = KVCache(
+        num_layers=model.model.config.num_hidden_layers,
+        batch_size=1,
+        page_size=page_size,
+        num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
+        cpu_offload=cpu_offload
+    )
+dist.barrier()
+if dist.get_rank() != 0:
+    kv_cache = KVCache(
+        num_layers=model.model.config.num_hidden_layers,
+        batch_size=1,
+        page_size=page_size,
+        num_heads=model.model.config.num_key_value_heads // dist.get_world_size(),
+        cpu_offload=cpu_offload
+    )
+dist.barrier()
+```
 
-    # input_ids: [bsz, n]
-    # labels: [bsz, n]
+### 2\. Chunk the input data
 
-    input_ids = list(my_chunkize(input_ids))
-    labels = list(my_chunkize(labels))
-    ```
+  * You can use the convenient chunking utility provided in our `utils`.
+  * Here, `4096` is the chunk size, which acts as the processing unit for the context. For GPUs with larger memory, you can increase this value to reduce the total number of training steps.
 
-3. 编写block-wise training pipeline
+<!-- end list -->
 
-    * 对于任意technique的组合，例如 +TP, +sparse attention，或者同时使用两者，都可以凭这段代码实现
-    * `pre_process`函数的作用主要和cpu-offload有关
-    * `post_process`函数则主要与反向传播有关
+```python
+from chunkoptim.utils import chunkize
+from functools import partial
 
-    ```python
-    with torch.no_grad():
-        for chunk_input, chunk_target in zip(input_ids, labels):
+my_chunkize = partial(chunkize, dim=-1, chunk_size=4096)
 
-            # forward pass
-            inputs = dict(
-                input_ids=chunk_input,
-                labels=chunk_target,
-                kv_cache=kv_cache,
-                grad_ckpt=False)
-            model(**inputs)
+# input_ids: [bsz, seq_len]
+# labels: [bsz, seq_len]
 
-    for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
+input_ids_chunks = list(my_chunkize(input_ids))
+labels_chunks = list(my_chunkize(labels))
+```
 
-        # forward prop
+### 3\. Implement the block-wise training pipeline
+
+  * This code structure works for any combination of techniques, such as using TP, sparse attention, or both simultaneously.
+  * The `pre_process` function is primarily related to CPU offloading.
+  * The `post_process` function is mainly for handling backpropagation.
+
+<!-- end list -->
+
+```python
+# First forward pass without gradients to populate the KV cache
+with torch.no_grad():
+    for chunk_input, chunk_target in zip(input_ids_chunks, labels_chunks):
         inputs = dict(
             input_ids=chunk_input,
             labels=chunk_target,
             kv_cache=kv_cache,
-            grad_ckpt=grad_ckpt)
-        loss = model(**inputs).sum() / seq_len
+            grad_ckpt=False
+        )
+        model(**inputs)
 
-        # backward prop
-        kv_cache.pre_process()
-        loss.backward()
-        kv_cache.post_process()
-    ```
+# Second forward pass and backward pass, chunk by chunk in reverse
+for chunk_input, chunk_target in reversed(list(zip(input_ids_chunks, labels_chunks))):
+    
+    # Forward propagation
+    inputs = dict(
+        input_ids=chunk_input,
+        labels=chunk_target,
+        kv_cache=kv_cache,
+        grad_ckpt=grad_ckpt # Enable gradient checkpointing here
+    )
+    loss = model(**inputs).sum() / total_seq_len
 
-    如果要支持deepspeed，则可以参考`test_efficiency/test_ds.py`中的pipeline，相比上面的代码只有少量更改
+    # Backward propagation
+    kv_cache.pre_process()
+    loss.backward()
+    kv_cache.post_process()
+```
+
+For **DeepSpeed** integration, please refer to the pipeline in `test_efficiency/test_ds.py`, which requires only minor modifications to the code above.
