@@ -1,7 +1,0 @@
-{
-    "method": "blockwise",
-    "block_size": 4096,
-    "grad_ckpt": false, 
-    "page_size": 128, 
-    "cpu_offload": 2
-}

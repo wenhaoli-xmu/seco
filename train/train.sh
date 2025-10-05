@@ -1,12 +1,10 @@
 MASTER_ADDR=localhost
 MASTER_PORT=$((RANDOM % 101 + 20000))
 
-
 torchrun \
     --rdzv-backend=c10d \
     --rdzv-endpoint=${MASTER_ADDR}:${MASTER_PORT} \
     --nnodes 1 \
     --nproc_per_node 4 \
-    test_efficiency/test.py \
-    --context "[1048576,2097152,4194304,8388608]" \
-    --config test_efficiency/config_blockwise_sparse.json
+    train/train.py \
+    --config train/config_blockwise_sparse.json

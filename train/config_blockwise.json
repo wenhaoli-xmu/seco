@@ -1,7 +1,7 @@
 {
     "method": "blockwise-tp",
     "block_size": 4096,
-    "grad_ckpt": true,
+    "grad_ckpt": false,
     "page_size": 128, 
-    "cpu_offload": 2
+    "cpu_offload": null
 }

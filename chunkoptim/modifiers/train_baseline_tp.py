@@ -3,11 +3,10 @@ import types
 import torch.nn as nn
 import torch.distributed as dist
 from ..modifier import Modifier
-from .utils import check_and_apply_qk_rope
-from peft import LoraConfig, get_peft_model, TaskType
+from .utils import check_and_apply_qk_rope, do_projection, generate_mask
 import torch.nn.functional as F
-from flash_attn import flash_attn_func
 from ..ops.all_gather import all_gather_uneven
+from ..ops import flash_attn_func
 from torch.utils.checkpoint import checkpoint
 
 
@@ -140,29 +139,20 @@ def self_attn_forward(self, hidden_states, kv_cache):
     embed_dim = self.config.hidden_size
     head_dim = embed_dim // self.config.num_attention_heads
     
-    ques = self.q_proj(hidden_states)
-    keys = self.k_proj(hidden_states)
-    vals = self.v_proj(hidden_states)
+    # query & key & value projection
+    ques = do_projection(self.q_proj, hidden_states, num_heads, head_dim, head_first=False)
+    keys = do_projection(self.k_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
+    vals = do_projection(self.v_proj, hidden_states, num_kv_heads, head_dim, head_first=False)
 
-    ques = ques.view(ques.shape[0], ques.shape[1], num_heads, head_dim)
-    keys = keys.view(keys.shape[0], keys.shape[1], num_kv_heads, head_dim)
-    vals = vals.view(vals.shape[0], vals.shape[1], num_kv_heads, head_dim)
-
-    past_length = kv_cache.length(self.layer_idx)
-    if torch.is_grad_enabled():
-        past_length -= ques.shape[1]
-
-    pos = torch.arange(past_length, past_length + keys.shape[1], device=keys.device).unsqueeze(0)
-    cos, sin = self.rotary_emb(vals, pos)
+    # position embedding
+    pos = torch.arange(0, keys.shape[1])
+    pos = pos[None, :].to(keys.device)
+    cos, sin = self.rotary_emb(keys, pos)
     ques, keys = check_and_apply_qk_rope(ques, keys, cos, sin)
 
-    manager = kv_cache[self.layer_idx]
-    if not torch.is_grad_enabled():
-        manager.update(keys, vals)
+    attn_output = flash_attn_func(ques, keys, vals)
 
-    attn_output = flash_attn_func(ques, keys, vals, causal=True)
     attn_output = attn_output.flatten(2)
-    
     attn_output = self.o_proj(attn_output)
 
     return attn_output

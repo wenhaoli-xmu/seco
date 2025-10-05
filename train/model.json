@@ -1,8 +1,8 @@
 {
     "model": {
-        "model_name": "Qwen/Qwen2.5-1.5B",
+        "model_name": "/mnt/shared-storage-user/liwenhao/Qwen2.5-7B",
         "model_dtype": "bf16",
-        "model_method": "baseline-tp",
+        "model_method": null,
         "model_structure": null,
         "save_ckp": null,
         "load_ckp": null,
@@ -12,15 +12,14 @@
 
     "train": {
         "train_iters": 256,
-        "max_lr": null,
-        "warmup": 0.01,
+        "max_lr": 5e-5,
+        "warmup": 0,
         "beta1": 0.9,
-        "beta2": 0.95,
-        "weight_decay": 0.05,
+        "beta2": 0.98,
+        "weight_decay": 0,
         "corpus": [
             {
-                "data": "data/pg19/train-24m.json",
-                "conf": "config/trunc-256k.json",
+                "data": "data/slimpajama/arxiv-pack-256k.pth",
                 "partition": 1.0
             }
         ]

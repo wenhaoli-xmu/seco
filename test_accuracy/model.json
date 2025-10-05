@@ -1,6 +1,6 @@
 {
     "model": {
-        "model_name": "/mnt/petrelfs/share_data/wangweiyun/share_ckpt_hf/Qwen2.5-7B",
+        "model_name": "/mnt/shared-storage-user/liwenhao/Qwen2.5-7B",
         "model_dtype": "bf16",
         "model_method": null,
         "model_structure": null,

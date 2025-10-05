@@ -11,7 +11,6 @@ from chunkoptim.utils import (
     chunkize)
 from functools import partial
 from pathlib import Path
-from chunkoptim.cache.kv_cache import KVCache
 import argparse, random, numpy, os
 from pygments.console import colorize
 
@@ -73,7 +72,7 @@ def backend_cleanup():
     dist.destroy_process_group()
 
 
-def launch_test(args, pipeline, method):
+def launch_test(args, pipeline, method, rewrite_name):
     backend_setup()
     
     env_conf = args.env_conf
@@ -116,9 +115,13 @@ def launch_test(args, pipeline, method):
     pipeline(
         model=model,
         batch=batch)
-    
+
+    save_name = f"{method}.pth" if rewrite_name is None else rewrite_name
+    path = os.path.join(args.root_dir, f"{save_name}")
+
     grad = [x.grad.data.cpu() for x in model.parameters()]
-    torch.save(grad, f"test_accuracy/{method}.pth")
+    name = [name for name, _ in model.named_parameters()]
+    torch.save({"name": name, "grad": grad}, path)
 
     backend_cleanup()
 
@@ -141,35 +144,42 @@ def print_grad(params):
             print("none")
 
 
-def baseline(model, batch, grad_ckpt, page_size):
-    kv_cache = KVCache(
-        num_layers=model.model.config.num_hidden_layers,
-        batch_size=1,
-        page_size=page_size,
-        num_heads=model.model.config.num_key_value_heads,
-        cpu_offload=None)
-
+def baseline_tensor_parallel(model, batch, grad_ckpt):
     loss = model(
         input_ids=batch['input_ids'],
         labels=batch['labels'],
-        kv_cache=kv_cache,
+        kv_cache=None,
         grad_ckpt=grad_ckpt).sum() / batch['seq_len']
     loss.backward()
 
     print(colorize('green', f'baseline-loss: {loss.item()}'), flush=True)
 
 
-def blockwise(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
+def blockwise_tensor_parallel(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
     my_chunkize = partial(chunkize, dim=-1, chunk_size=block_size)
     input_ids = list(my_chunkize(batch['input_ids']))
     labels = list(my_chunkize(batch['labels']))
 
-    kv_cache = KVCache(
-        num_layers=model.model.config.num_hidden_layers,
-        batch_size=1,
-        page_size=page_size,
-        num_heads=model.model.config.num_key_value_heads,
-        cpu_offload=cpu_offload)
+    from chunkoptim.cache.kv_cache import KVCache
+
+    world_size = dist.get_world_size()
+
+    if dist.get_rank() == 0:
+        kv_cache = KVCache(
+            num_layers=model.model.config.num_hidden_layers,
+            batch_size=1,
+            page_size=page_size,
+            num_heads=model.model.config.num_key_value_heads // world_size,
+            cpu_offload=cpu_offload)
+    dist.barrier()
+    if dist.get_rank() != 0:
+        kv_cache = KVCache(
+            num_layers=model.model.config.num_hidden_layers,
+            batch_size=1,
+            page_size=page_size,
+            num_heads=model.model.config.num_key_value_heads // world_size,
+            cpu_offload=cpu_offload)
+    dist.barrier()
     
     accum_loss = 0
 
@@ -201,10 +211,72 @@ def blockwise(model, batch, grad_ckpt, block_size, page_size, cpu_offload):
     print(colorize('green', f'blockwise-loss: {accum_loss}'), flush=True)
 
 
+def blockwise_tensor_parallel_sparse(model, batch, grad_ckpt, block_size, page_size, cpu_offload, page_budget):
+    my_chunkize = partial(chunkize, dim=-1, chunk_size=block_size)
+    input_ids = list(my_chunkize(batch['input_ids']))
+    labels = list(my_chunkize(batch['labels']))
+
+    from chunkoptim.cache.topk_cache import SparseKVCache
+
+    world_size = dist.get_world_size()
+
+    if dist.get_rank() == 0:
+        kv_cache = SparseKVCache(
+            num_layers=model.model.config.num_hidden_layers,
+            batch_size=1,
+            page_size=page_size,
+            num_heads=model.model.config.num_key_value_heads// world_size,
+            cpu_offload=cpu_offload,
+            page_budget=page_budget)
+    dist.barrier()
+    if dist.get_rank() != 0:
+        kv_cache = SparseKVCache(
+            num_layers=model.model.config.num_hidden_layers,
+            batch_size=1,
+            page_size=page_size,
+            num_heads=model.model.config.num_key_value_heads // world_size,
+            cpu_offload=cpu_offload,
+            page_budget=page_budget)
+    dist.barrier()
+
+    accum_loss = 0
+
+    with torch.no_grad():
+        for chunk_input, chunk_target in zip(input_ids, labels):
+
+            # forward pass
+            inputs = dict(
+                input_ids=chunk_input,
+                labels=chunk_target,
+                kv_cache=kv_cache,
+                grad_ckpt=False)
+            accum_loss += model(**inputs).sum() / batch['seq_len']
+
+    for chunk_input, chunk_target in reversed(list(zip(input_ids, labels))):
+
+        # forward prop
+        inputs = dict(
+            input_ids=chunk_input,
+            labels=chunk_target,
+            kv_cache=kv_cache,
+            grad_ckpt=grad_ckpt)
+        loss = model(**inputs).sum() / batch['seq_len']
+
+        # backward prop
+        kv_cache.pre_process()
+        loss.backward()
+        kv_cache.post_process()
+
+    print(colorize('green', f'blockwise-sparse-loss: {accum_loss}'), flush=True)
+
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument("--context", type=int, default=16384)
     parser.add_argument("--config", type=str, required=True)
+    parser.add_argument("--rewrite-config", type=str, default="{}")
+    parser.add_argument("--rewrite-name", type=str, default=None)
+    parser.add_argument("--root-dir", type=str, default='test_accuracy')
     args = parser.parse_args()
 
     args.config = json.load(open(args.config, 'r'))
@@ -215,11 +287,18 @@ if __name__ == '__main__':
     args.env_conf['model']['model_method'] = method
     kwargs = args.config
 
-    if method == 'baseline':
-        pipe = baseline
+    if args.rewrite_config is not None:
+        rewrite_config = json.loads(args.rewrite_config)
+        kwargs.update(rewrite_config)
 
-    elif method == 'blockwise':
-        pipe = blockwise
+    if method == 'baseline-tp':
+        pipe = baseline_tensor_parallel
+
+    elif method == 'blockwise-tp':
+        pipe = blockwise_tensor_parallel
+
+    elif method == 'blockwise-tp-sparse':
+        pipe = blockwise_tensor_parallel_sparse
 
     pipe = partial(pipe, **kwargs)
-    launch_test(args, pipe, method)
+    launch_test(args, pipe, method, args.rewrite_name)

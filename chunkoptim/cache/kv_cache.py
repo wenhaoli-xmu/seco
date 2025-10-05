@@ -3,16 +3,17 @@ from torch.cuda import Stream
 from ..ops.utils import IS_BF16_ATOM_ADD_SUPPORTED
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
-
+import torch.distributed as dist
 
 class SimpleCacheManager:
-    def __init__(self, batch_size, page_size, num_kv_heads, head_dim):
+    def __init__(self, batch_size, page_size, num_kv_heads, head_dim, local_rank):
         super().__init__()
         self.batch_size = batch_size
         self.page_size = page_size
         self.num_kv_heads = num_kv_heads
         self.head_dim = head_dim
         self.device = 'cuda'
+        self.cuda = f'cuda:{dist.get_rank() if local_rank is None else local_rank}'
         self.reset()
 
     def reset(self):
@@ -42,7 +43,7 @@ class SimpleCacheManager:
         page_table = torch.tensor(
             page_table, 
             dtype=int, 
-            device='cuda')
+            device=self.cuda)
 
         return page_table
 
@@ -66,11 +67,11 @@ class SimpleCacheManager:
         return kgd, vgd
     
     @torch.inference_mode()
-    def onload(self):
+    def onload(self, stage):
         ...
 
     @torch.inference_mode()
-    def offload(self):
+    def offload(self, stage):
         ...
 
     @torch.inference_mode()
@@ -144,14 +145,15 @@ class SimpleCacheManager:
     
 
 class CacheManager(SimpleCacheManager):
-    def __init__(self, batch_size, page_size, num_kv_heads, head_dim):
-        super().__init__(batch_size, page_size, num_kv_heads, head_dim)
+    def __init__(self, batch_size, page_size, num_kv_heads, head_dim, local_rank):
+        super().__init__(batch_size, page_size, num_kv_heads, head_dim, local_rank)
 
         self.offload_future = None
         self.onload_future = None
 
         self.stream = Stream()
         self.pool = ThreadPoolExecutor(1)
+        self.fake = torch.zeros((1,), device=self.cuda)
 
     def reset(self):
         super().reset()
@@ -162,6 +164,7 @@ class CacheManager(SimpleCacheManager):
 
     @torch.inference_mode()
     def remove_last_update(self):
+        self.wait_onload()
         self.wait_offload()
 
         update_token, update_pages = super().remove_last_update()
@@ -229,30 +232,37 @@ class CacheManager(SimpleCacheManager):
         self.kgd_cpu.extend(kgd_cpu)
         self.vgd_cpu.extend(vgd_cpu)
     
-    def onload(self):
+    def onload(self, stage):
         @torch.inference_mode()
         def worker():
             with torch.cuda.stream(self.stream):
                 for i in range(len(self.key_cpu)):
-                    self.key_gpu[i] = self.key_cpu[i].to('cuda', non_blocking=True)
-                    self.val_gpu[i] = self.val_cpu[i].to('cuda', non_blocking=True)
-                    self.kgd_gpu[i] = self.kgd_cpu[i].to('cuda', non_blocking=True)
-                    self.vgd_gpu[i] = self.vgd_cpu[i].to('cuda', non_blocking=True)
+                    self.key_gpu[i] = self.key_cpu[i].to(self.cuda, non_blocking=True)
+                    self.val_gpu[i] = self.val_cpu[i].to(self.cuda, non_blocking=True)
+
+                    if stage == 2:
+                        self.kgd_gpu[i] = self.kgd_cpu[i].to(self.cuda, non_blocking=True)
+                        self.vgd_gpu[i] = self.vgd_cpu[i].to(self.cuda, non_blocking=True)
+                    else:
+                        self.kgd_gpu[i] = self.fake
+                        self.vgd_gpu[i] = self.fake
 
         if self.device != 'cuda':
             self.device = 'cuda'
             self.wait_onload()
             self.onload_future = self.pool.submit(worker)
 
-    def offload(self):
+    def offload(self, stage):
         @torch.inference_mode()
         def worker():
             with torch.cuda.stream(self.stream):
                 for i in range(len(self.key_cpu)):
                     self.key_cpu[i].copy_(self.key_gpu[i])
                     self.val_cpu[i].copy_(self.val_gpu[i])
-                    self.kgd_cpu[i].copy_(self.kgd_gpu[i])
-                    self.vgd_cpu[i].copy_(self.vgd_gpu[i])
+
+                    if stage == 2:
+                        self.kgd_cpu[i].copy_(self.kgd_gpu[i])
+                        self.vgd_cpu[i].copy_(self.vgd_gpu[i])
 
                     self.key_gpu[i] = None
                     self.val_gpu[i] = None
@@ -295,7 +305,8 @@ class KVCache:
         page_size: int = 64,
         num_heads: int = 4,
         head_dim: int = 128,
-        cpu_offload=None):
+        cpu_offload=None,
+        local_rank=None):
 
         self.num_layers = num_layers    
         self.cpu_offload = cpu_offload
@@ -307,14 +318,15 @@ class KVCache:
                 batch_size,
                 page_size,
                 num_heads,
-                head_dim)
+                head_dim,
+                local_rank)
             for _ in range(num_layers)]
 
     def reset(self):
         for m in self.managers:
             m.reset()
 
-    def visit(self, layer_idx, reverse=False):
+    def visit(self, layer_idx, stage, reverse=False):
         if self.cpu_offload is not None:
             factor = -1 if reverse else 1
             cuda_layers = [
@@ -323,9 +335,9 @@ class KVCache:
             cpu_layers = list(filter(lambda i: i not in cuda_layers, range(self.num_layers)))
             
             for lid in cpu_layers:
-                self.managers[lid].offload()
+                self.managers[lid].offload(stage)
             for lid in cuda_layers:
-                self.managers[lid].onload()
+                self.managers[lid].onload(stage)
 
     def length(self, layer_idx):
         return self.managers[layer_idx].num_kv
@@ -335,12 +347,11 @@ class KVCache:
         return (m.device for m in self.managers)
     
     def __getitem__(self, idx):
-        self.visit(idx)
         return self.managers[idx]
     
     def pre_process(self):
         for idx, m in enumerate(self.managers):
-            m.grad_hook = lambda idx=idx: self.visit(idx, True)
+            m.grad_hook = lambda idx=idx: self.visit(idx, 2, True)
 
     def post_process(self):
         for m in self.managers:

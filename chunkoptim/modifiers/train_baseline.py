@@ -6,7 +6,6 @@ from .utils import check_and_apply_qk_rope, do_projection, generate_mask
 
 from torch.utils.checkpoint import checkpoint
 import torch.nn.functional as F
-from ..cache.kv_cache import CacheManager, KVCache
 from ..ops import flash_attn_func
 
 
@@ -60,35 +59,6 @@ def layer_forward(self, hidden_states, kv_cache):
     hidden_states = residual + hidden_states
 
     return hidden_states
-
-
-def float64_attention(q, k, v, causal=False):
-    num_q_heads = q.shape[-2]
-    num_kv_heads = k.shape[-2]
-
-    head_dim = q.shape[-1]  # Head dimension
-    
-    # Expand keys/values if needed for GQA
-    if num_q_heads > num_kv_heads:
-        expand_factor = num_q_heads // num_kv_heads
-        k = k.tile(1, 1, expand_factor, 1)
-        v = v.tile(1, 1, expand_factor, 1)
-    
-    # Compute scaled dot-product attention
-    attn_scores = torch.einsum("bqhd, bkhd -> bhqk", q, k) / head_dim**0.5
-    
-    if causal:
-        mask = generate_mask(
-            num_query=attn_scores.shape[-2], 
-            num_kv=attn_scores.shape[-1], 
-            dtype=attn_scores.dtype, 
-            device=attn_scores.device)
-        attn_scores += mask
-    
-    attn_probs = F.softmax(attn_scores, dim=-1)
-    attn_output = torch.einsum("bhqk,bkhd->bqhd", attn_probs, v)
-    
-    return attn_output
 
 
 def self_attn_forward(self, hidden_states, kv_cache):

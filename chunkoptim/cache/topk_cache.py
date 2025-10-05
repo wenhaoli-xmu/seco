@@ -4,6 +4,8 @@ from ..ops.utils import IS_BF16_ATOM_ADD_SUPPORTED
 from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 from .kv_cache import SimpleCacheManager
+import torch.distributed as dist
+from pygments.console import colorize
 
 
 def maybe_pad_query(x, tile):
@@ -17,8 +19,8 @@ def maybe_pad_query(x, tile):
 
 
 class SimpleSparseCacheManager(SimpleCacheManager):
-    def __init__(self, batch_size, page_size, num_kv_heads, head_dim, page_budget):
-        super().__init__(batch_size, page_size, num_kv_heads, head_dim)
+    def __init__(self, batch_size, page_size, num_kv_heads, head_dim, page_budget, local_rank):
+        super().__init__(batch_size, page_size, num_kv_heads, head_dim, local_rank)
         self.page_budget = page_budget
 
     def reset(self):
@@ -57,8 +59,8 @@ class SimpleSparseCacheManager(SimpleCacheManager):
 
 
 class SparseCacheManager(SimpleSparseCacheManager):
-    def __init__(self, batch_size, page_size, num_kv_heads, head_dim, page_budget):
-        super().__init__(batch_size, page_size, num_kv_heads, head_dim, page_budget)
+    def __init__(self, batch_size, page_size, num_kv_heads, head_dim, page_budget, local_rank):
+        super().__init__(batch_size, page_size, num_kv_heads, head_dim, page_budget, local_rank)
 
         self.offload_future = None
         self.onload_future = None
@@ -76,13 +78,14 @@ class SparseCacheManager(SimpleSparseCacheManager):
 
     @torch.inference_mode()
     def remove_last_update(self):
+        self.wait_onload()
         self.wait_offload()
 
         update_token, update_pages = super().remove_last_update()
 
         if update_token is None:
             return 
-        
+
         del self.key_cpu[-update_pages:]
         del self.val_cpu[-update_pages:]
         del self.kgd_cpu[-update_pages:]
@@ -156,41 +159,58 @@ class SparseCacheManager(SimpleSparseCacheManager):
             if sps_index is None:
                 # load all kv cache
                 for i in range(num_pages):
-                    self.key_gpu[i] = self.key_cpu[i].to('cuda', non_blocking=True)
-                    self.val_gpu[i] = self.val_cpu[i].to('cuda', non_blocking=True)
-                    self.kgd_gpu[i] = self.kgd_cpu[i].to('cuda', non_blocking=True)
-                    self.vgd_gpu[i] = self.vgd_cpu[i].to('cuda', non_blocking=True)
+                    self.key_gpu[i] = self.key_cpu[i].to(self.cuda, non_blocking=True)
+                    self.val_gpu[i] = self.val_cpu[i].to(self.cuda, non_blocking=True)
+
+                    if stage == 2:
+                        self.kgd_gpu[i] = self.kgd_cpu[i].to(self.cuda, non_blocking=True)
+                        self.vgd_gpu[i] = self.vgd_cpu[i].to(self.cuda, non_blocking=True)
+                    else:
+                        self.kgd_gpu[i] = self.fake
+                        self.vgd_gpu[i] = self.fake
                 return
 
             idx_set = set(sps_index.flatten().tolist())
 
             with torch.cuda.stream(self.stream):
 
-                for i in range(rng_onload):
-                    if i in idx_set:
-                        self.key_gpu[i] = self.key_cpu[i].to('cuda', non_blocking=True)
-                        self.val_gpu[i] = self.val_cpu[i].to('cuda', non_blocking=True)
-                        self.kgd_gpu[i] = self.kgd_cpu[i].to('cuda', non_blocking=True)
-                        self.vgd_gpu[i] = self.vgd_cpu[i].to('cuda', non_blocking=True)
-                    else:
-                        self.key_gpu[i] = self.fake
-                        self.val_gpu[i] = self.fake
+                if stage == 1:
+                    for i in range(rng_onload):
+                        if i in idx_set:
+                            self.key_gpu[i] = self.key_cpu[i].to(self.cuda, non_blocking=True)
+                            self.val_gpu[i] = self.val_cpu[i].to(self.cuda, non_blocking=True)
+                        else:
+                            self.key_gpu[i] = self.fake
+                            self.val_gpu[i] = self.fake
+
                         self.kgd_gpu[i] = self.fake
                         self.vgd_gpu[i] = self.fake
 
-                if stage == 2:
+                elif stage == 2:
+                    for i in range(rng_onload):
+                        if i in idx_set:
+                            self.key_gpu[i] = self.key_cpu[i].to(self.cuda, non_blocking=True)
+                            self.val_gpu[i] = self.val_cpu[i].to(self.cuda, non_blocking=True)
+                            self.kgd_gpu[i] = self.kgd_cpu[i].to(self.cuda, non_blocking=True)
+                            self.vgd_gpu[i] = self.vgd_cpu[i].to(self.cuda, non_blocking=True)
+                        else:
+                            self.key_gpu[i] = self.fake
+                            self.val_gpu[i] = self.fake
+                            self.kgd_gpu[i] = self.fake
+                            self.vgd_gpu[i] = self.fake
+
                     for i in range(rng_onload, num_pages):
-                        self.key_gpu[i] = self.key_cpu[i].to('cuda', non_blocking=True)
-                        self.val_gpu[i] = self.val_cpu[i].to('cuda', non_blocking=True)
-                        self.kgd_gpu[i] = self.kgd_cpu[i].to('cuda', non_blocking=True)
-                        self.vgd_gpu[i] = self.vgd_cpu[i].to('cuda', non_blocking=True)
+                        self.key_gpu[i] = self.key_cpu[i].to(self.cuda, non_blocking=True)  
+                        self.val_gpu[i] = self.val_cpu[i].to(self.cuda, non_blocking=True)
+                        self.kgd_gpu[i] = self.kgd_cpu[i].to(self.cuda, non_blocking=True)
+                        self.vgd_gpu[i] = self.vgd_cpu[i].to(self.cuda, non_blocking=True)
 
         if self.device != 'cuda':
             self.device = 'cuda'
             self.wait_onload()
             self.onload_future = self.pool.submit(worker)
 
-    def offload(self):
+    def offload(self, stage):
         num_pages = len(self.key_cpu)
 
         @torch.inference_mode()
@@ -200,8 +220,10 @@ class SparseCacheManager(SimpleSparseCacheManager):
                     if self.key_gpu[i] is not self.fake:
                         self.key_cpu[i].copy_(self.key_gpu[i])
                         self.val_cpu[i].copy_(self.val_gpu[i])
-                        self.kgd_cpu[i].copy_(self.kgd_gpu[i])
-                        self.vgd_cpu[i].copy_(self.vgd_gpu[i])
+
+                        if stage == 2:
+                            self.kgd_cpu[i].copy_(self.kgd_gpu[i])
+                            self.vgd_cpu[i].copy_(self.vgd_gpu[i])
 
                     self.key_gpu[i] = None
                     self.val_gpu[i] = None
@@ -245,7 +267,8 @@ class SparseKVCache:
         num_heads: int = 4,
         head_dim: int = 128,
         page_budget: int = 128,
-        cpu_offload=None):
+        cpu_offload=None,
+        local_rank=None):
 
         self.num_layers = num_layers    
         self.cpu_offload = cpu_offload
@@ -258,14 +281,15 @@ class SparseKVCache:
                 page_size,
                 num_heads,
                 head_dim,
-                page_budget)
+                page_budget,
+                local_rank)
             for _ in range(num_layers)]
 
     def reset(self):
         for m in self.managers:
             m.reset()
 
-    def visit(self, layer_idx, reverse=False):
+    def visit(self, layer_idx, stage, reverse=False):
         if self.cpu_offload is not None:
             factor = -1 if reverse else 1
             cuda_layers = [
@@ -274,7 +298,7 @@ class SparseKVCache:
             cpu_layers = list(filter(lambda i: i not in cuda_layers, range(self.num_layers)))
             
             for lid in cpu_layers:
-                self.managers[lid].offload()
+                self.managers[lid].offload(stage)
 
             if reverse:
                 for lid in cuda_layers:
@@ -289,7 +313,7 @@ class SparseKVCache:
     
     def pre_process(self):
         for idx, m in enumerate(self.managers):
-            m.grad_hook = lambda idx=idx: self.visit(idx, True)
+            m.grad_hook = lambda idx=idx: self.visit(idx, 2, True)
 
     def post_process(self):
         for m in self.managers:
