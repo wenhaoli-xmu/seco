@@ -1,7 +1,8 @@
 # Out of the Memory Barrier: A Highly Memory-Efficient Training System for LLMs with Million-Token Contexts
 
 ## Foreword
-⚠️ This document is for anonymous review. For reproduction and standard documentation, please see [docs/README.md](docs/README.md).
+
+**⚠️ This document is for anonymous review. For reproduction and standard documentation, please see [docs/README.md](docs/README.md).**
 
 There are two ways to review the code:
 
