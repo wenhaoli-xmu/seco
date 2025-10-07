@@ -9,10 +9,6 @@ from ..ops.flash_paged_attn import flash_paged_attn_func
 from torch.utils.checkpoint import checkpoint
 
 
-torch.backends.cudnn.deterministic = True
-torch.backends.cudnn.benchmark = False
-
-
 def model_forward(self, input_ids, kv_cache, grad_ckpt, **kwargs):
     """
     Input

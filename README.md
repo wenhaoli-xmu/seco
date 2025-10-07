@@ -1,7 +1,7 @@
 # Out of the Memory Barrier: A Highly Memory-Efficient Training System for LLMs with Million-Token Contexts
 
 ## Foreword
-⚠️ This document is for anonymous review. For reproduction methods and standard documentation, please see [xxx.md]
+⚠️ This document is for anonymous review. For reproduction and standard documentation, please see [docs/README.md](docs/README.md).
 
 There are two ways to review the code:
 
@@ -26,7 +26,7 @@ def baseline_tensor_parallel(model, batch, grad_ckpt):
     loss = model(
         input_ids=batch['input_ids'],
         labels=batch['labels'],
-        kv_cache=None, # ChunkOptim is not used, so no KVCache is passed.
+        kv_cache=None, # chunk-wise training is not used, so no KVCache is passed.
         grad_ckpt=grad_ckpt).sum() / batch['seq_len']
 
     # Backward pass
@@ -157,31 +157,6 @@ input_ids_chunks = list(my_chunkize(input_ids))
 labels_chunks = list(my_chunkize(labels))
 ```
 
-### 3\. Implement the block-wise training pipeline
-
-  * This code structure works for any combination of techniques, such as using TP, sparse attention, or both simultaneously.
-  * The `pre_process` function is primarily related to CPU offloading.
-  * The `post_process` function is mainly for handling backpropagation.
-
-<!-- end list -->
-
-```python
-# First forward pass without gradients to populate the KV cache
-with torch.no_grad():
-    for chunk_input, chunk_target in zip(input_ids_chunks, labels_chunks):
-        inputs = dict(
-            input_ids=chunk_input,
-            labels=chunk_target,
-            kv_cache=kv_cache,
-            grad_ckpt=grad_ckpt)
-        loss = model(**inputs).sum() / batch['seq_len']
-
-        # backward prop
-        kv_cache.pre_process()
-        loss.backward()
-        kv_cache.post_process()
-```
-
 </details>
 </td>
 </tr>
@@ -287,7 +262,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
     # ================================================
 
     # Here, we call our custom Triton kernel, passing the KV cache manager 
-    # to retrieve the page table.
+    # to get the page table.
     attn_output = flash_paged_attn_func(
         ques,
         keys,
@@ -310,7 +285,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
 
 ```python
 """
-This code is mostly identical to section B. However, after the query projection 
+This code is mostly identical to code B. However, after the query projection 
 is complete, sparse KV cache retrieval is immediately triggered to maximize the 
 overlap between data transfer and computation.
 
@@ -909,7 +884,7 @@ class SimpleCacheManager:
     @torch.inference_mode()
     def remove_last_update(self):
         """
-        Used in ChunkOptim. This removes a KV cache chunk from right to left, 
+        Used in chunk-wise training. This removes a KV cache chunk from right to left, 
         indicating that all computations related to it are finished and it can be evicted.
         """
         if len(self.last_update_pages) == 1:
