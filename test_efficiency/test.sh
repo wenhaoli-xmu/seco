@@ -8,5 +8,5 @@ torchrun \
     --nnodes 1 \
     --nproc_per_node 4 \
     test_efficiency/test.py \
-    --context "[1048576,2097152,4194304,8388608]" \
+    --context "[32768, 65536, 131072, 262144, 524288, 1048576]" \
     --config test_efficiency/config_blockwise_sparse.json

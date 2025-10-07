@@ -5,6 +5,7 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Lock
 import torch.distributed as dist
 
+
 class SimpleCacheManager:
     def __init__(self, batch_size, page_size, num_kv_heads, head_dim, local_rank):
         super().__init__()
