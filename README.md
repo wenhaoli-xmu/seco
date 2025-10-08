@@ -365,7 +365,7 @@ def self_attn_forward(self, hidden_states, kv_cache):
 
 ---
 
-![img](docs/framework.png)
+<img src="docs/framework.png" width=600/>
 
 ### 1. Triton Kernel Code
 <table style="width:100%; border: none;">
