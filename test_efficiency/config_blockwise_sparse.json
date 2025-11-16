@@ -1,9 +1,9 @@
 {
     "method": "blockwise-tp-sparse",
-    "block_size": 4096,
+    "block_size": 12288,
     "grad_ckpt": true,
     "page_size": 128, 
     "cpu_offload": 2,
-    "page_budget": 64,
+    "page_budget": 256,
     "visualize": null
 }
