@@ -130,6 +130,7 @@ def launch_test(args, pipeline):
 
         mean_time, mean_memory = history.summary(False)
         template = colorize("yellow", f"{context:<5d}\t|") + "{mean_time:<3.3f}\t| {mean_memory:.3f}"
+        print(template.format(mean_time=mean_time, mean_memory=mean_memory), flush=True)
 
     backend_cleanup()
 
